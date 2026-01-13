@@ -1,134 +1,135 @@
+import asyncio
 import os
 import sys
-from dotenv import load_dotenv
-from groq import Groq
-from fastrtc import Stream, ReplyOnPause, audio_to_bytes
-import numpy as np
-from loguru import logger
 
-# --- ARABISCH DISPLAY FIX ---
+# --- 1. SYSTEM-LOGGING SÄUBERN ---
+# Entfernt alle technischen Debug-Meldungen von Pipecat/HTTP
+from loguru import logger as system_logger
+system_logger.remove()
+system_logger.add(sys.stderr, level="CRITICAL")
+
+# --- 2. BIBLIOTHEKEN LADEN ---
 import arabic_reshaper
 from bidi.algorithm import get_display
+from colorama import Fore, Style, init
 
-# Konfiguration der Konsole
-logger.remove()
-logger.add(
-    sys.stdout,
-    colorize=True,
-    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
-)
+from pipecat.frames.frames import TranscriptionFrame, ErrorFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.services.groq.stt import GroqSTTService
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
-load_dotenv()
-client = Groq()
+# Windows Terminal auf UTF-8 zwingen
+init()
+if sys.platform == "win32":
+    os.system("chcp 65001 >nul")
 
-# --- GEDÄCHTNIS (MEMORY) ---
-last_context = ""
-
-# --- SCHUTZ GEGEN HALLUZINATIONEN ---
-# Diese Sätze ignoriert das Skript komplett, wenn sie auftauchen
-HALLUCINATION_FILTERS = [
-    "اشترك في القناة",       # Abonnieren
-    "اشتركوا في القناة",     # Abonniert den Kanal
-    "شكرا للمشاهدة",         # Danke fürs Zuschauen
-    "لا تنسوا الاشتراك",     # Vergesst nicht zu abonnieren
-    "تفعيل الجرس",           # Glocke aktivieren
-    "Amara.org",             # Untertitel Credits
-    "Subtitles by",
-    "MBC",                   # TV Sender Rauschen
-    "Copyright",
-    ".",                     # Einzelne Punkte
-    "?"                      # Einzelne Fragezeichen
-]
-
-def format_arabic_for_console(text):
-    """Hilfsfunktion: Macht Arabisch in der Konsole lesbar"""
-    reshaped_text = arabic_reshaper.reshape(text)
-    return get_display(reshaped_text)
-
-def normalize_audio(audio_data):
+# -------------------------------------------------------------------------
+# HELPER: Arabische Schrift für Terminal fixen
+# -------------------------------------------------------------------------
+def fix_arabic_text(text):
     """
-    Audio-Normalisierung MIT Noise Gate.
-    Verhindert, dass Stille zu lautem Rauschen verstärkt wird (Ursache für Halluzinationen).
+    Verbindet arabische Buchstaben und dreht die Leserichtung für das Terminal.
     """
-    if np.max(np.abs(audio_data)) == 0:
-        return audio_data
-        
-    audio_float = audio_data.astype(np.float32)
-    max_val = np.max(np.abs(audio_float))
-    
-    # --- NEU: NOISE GATE ---
-    # Wenn das Signal extrem leise ist (nur Rauschen), NICHT verstärken!
-    # Ein Wert von 500 ist ein guter Schwellenwert für "Stille"
-    if max_val < 500: 
-        return audio_data # Gib das Original zurück, mach es nicht lauter!
-    
-    # Wenn Signal laut genug ist, verstärken
-    target_level = 31000 
-    if max_val < target_level:
-        boost_factor = target_level / max_val
-        boost_factor = min(boost_factor, 10.0) 
-        boosted_audio = audio_float * boost_factor
-        return boosted_audio.astype(np.int16)
-            
-    return audio_data
-
-def is_clean_text(text):
-    """Prüft, ob der Text eine bekannte Halluzination ist."""
-    if not text or len(text.strip()) < 2:
-        return False
-        
-    # Prüfen ob einer der verbotenen Sätze im Text vorkommt
-    for bad_phrase in HALLUCINATION_FILTERS:
-        if bad_phrase in text:
-            return False
-            
-    return True
-
-def transcribe_handler(audio: tuple[int, np.ndarray]):
-    global last_context
-    sample_rate, audio_data = audio
-    
+    if not text or not text.strip():
+        return ""
     try:
-        # 1. Optimieren (Jetzt mit Noise Gate Schutz)
-        optimized_audio_data = normalize_audio(audio_data)
+        reshaped_text = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped_text)
+        return bidi_text
+    except Exception:
+        return text
+
+# -------------------------------------------------------------------------
+# LOGGER: Professionelle Ausgabe
+# -------------------------------------------------------------------------
+class ProductionLogger(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            if text:
+                formatted = fix_arabic_text(text)
+                # Ausgabeformat: Grün, Fett, Sauber
+                print(f"{Fore.GREEN}{Style.BRIGHT}📝 TEXT:{Style.RESET_ALL} {formatted}")
         
-        # 2. Transkription
-        transcript_obj = client.audio.transcriptions.create(
-            file=("audio-file.mp3", audio_to_bytes((sample_rate, optimized_audio_data))),
-            model="whisper-large-v3-turbo",
-            response_format="text",
-            language="ar",
-            prompt=last_context,
-            temperature=0.0 # Temperatur auf 0 zwingt das Modell, präziser zu sein
+        elif isinstance(frame, ErrorFrame):
+            print(f"{Fore.RED}❌ FEHLER: {frame.error}{Style.RESET_ALL}")
+
+# -------------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------------
+async def main():
+    # 1. API Key Prüfung
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        print(f"{Fore.RED}FEHLER: GROQ_API_KEY fehlt in den Umgebungsvariablen.{Style.RESET_ALL}")
+        return
+
+    # 2. UI Header
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"{Fore.YELLOW}=======================================================")
+    print(f"   ARABIC TRANSCRIPTION ENGINE (Pro Config)")
+    print(f"   Modell: Whisper-Large-v3-Turbo | Modus: Hocharabisch")
+    print(f"======================================================={Style.RESET_ALL}\n")
+
+    # 3. VAD (Voice Activity Detection) - Tuning für Produktion
+    vad_params = VADParams(
+        confidence=0.6,      # Hohe Schwelle: Ignoriert Lüfter/Atmen
+        start_secs=0.2,      # Reagiert schnell auf Sprachbeginn
+        stop_secs=0.8,       # Wartet 0.8s Stille (Wichtig für arabische Pausen!)
+        min_volume=0.0       # Ignoriert Lautstärke, achtet nur auf Sprach-Muster
+    )
+
+    transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_out_enabled=False, # Kein Lautsprecher nötig (nur Input)
+            audio_in_enabled=True,
+            vad_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(params=vad_params)
         )
-        
-        current_text = transcript_obj.strip()
-        
-        # 3. FILTER CHECK
-        if current_text:
-            if is_clean_text(current_text):
-                # Nur wenn es KEINE Halluzination ist:
-                last_context = (last_context + " " + current_text)[-200:]
-                display_text = format_arabic_for_console(current_text)
-                logger.success(f"📄 {display_text}")
-            else:
-                logger.warning(f"👻 Halluzination abgefangen: {format_arabic_for_console(current_text)}")
-        
-    except Exception as e:
-        logger.error(f"❌ Fehler: {e}")
+    )
 
-    if False: yield None
+    # 4. STT (Groq) - Der Kern für Qualität
+    # Dieser Prompt zwingt Whisper in den "Fusha"-Modus
+    arabic_system_prompt = "اللغة العربية الفصحى. يرجى الكتابة بدقة لغوية عالية وتجنب الهلوسة. التشكيل عند الضرورة."
+    # Bedeutung: "Hocharabisch. Bitte mit hoher sprachlicher Genauigkeit schreiben und Halluzinationen vermeiden."
 
-# Stream Konfiguration
-stream = Stream(
-    modality="audio",
-    mode="send",
-    handler=ReplyOnPause(transcribe_handler)
-)
+    stt = GroqSTTService(
+        api_key=groq_key,
+        model="whisper-large-v3-turbo", # Turbo für max Geschwindigkeit
+        language="ar",                  # Sprache festlegen
+        prompt=arabic_system_prompt,    # <--- DEIN GEWÜNSCHTER PROMPT
+        temperature=0.0                 # <--- WICHTIG: 0.0 verhindert Erfindungen/Halluzinationen
+    )
+
+    # 5. Pipeline Aufbau
+    logger = ProductionLogger()
+
+    pipeline = Pipeline([
+        transport.input(), # Mikrofon
+        stt,               # Whisper AI
+        logger             # Ausgabe
+    ])
+
+    task = PipelineTask(
+        pipeline, 
+        params=PipelineParams(allow_interruptions=True)
+    )
+
+    runner = PipelineRunner()
+
+    print(f"{Fore.CYAN}System bereit. Bitte sprechen... (STRG+C zum Beenden){Style.RESET_ALL}\n")
+
+    try:
+        await runner.run(task)
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}Beendet.{Style.RESET_ALL}")
 
 if __name__ == "__main__":
-    os.system("chcp 65001 > nul") 
-    
-    logger.info("🚀 ENGINE GESTARTET")
-    logger.info("   (Schutz aktiv: Noise Gate & Anti-Youtube-Filter)")
-    stream.ui.launch()
+    asyncio.run(main())
