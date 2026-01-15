@@ -63,7 +63,7 @@ class TranslationLogger(FrameProcessor):
         if isinstance(frame, TextFrame):
             text = frame.text.strip()
             if text:
-                if "[AR]" in text:
+                if "§" in text:
                     clean = text.replace("[AR]", "").strip()
                     print(f"\n{C_AR}🎤 Arabisch: {clean}{C_RESET}")
                 elif "[DE]" in text:
@@ -97,8 +97,8 @@ async def main():
         "Du bist ein professioneller Simultan-Dolmetscher."
         "Regeln:"
         "1. Höre auf Arabisch."
-        "2. Gib das arabische Transkript als TEXT aus: '[AR] ...'. NICHT vorlesen."
-        "3. Übersetze ins Deutsche: '[DE] ...'."
+        "2. Gib das arabische Transkript als TEXT aus: '...'. NICHT vorlesen."
+        "3. Übersetze ins Deutsche: '| ...'.§"
         "4. Sprich (Audio) NUR den deutschen Teil."
     )
 
