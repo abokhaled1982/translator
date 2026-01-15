@@ -1,111 +1,85 @@
 import asyncio
 import os
 import pyaudio
-import threading
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
-import arabic_reshaper
-from bidi.algorithm import get_display
-from colorama import init, Fore, Style
+from google import genai
 
 load_dotenv()
-init(autoreset=True)
 
 # --- KONFIGURATION ---
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SEND_SAMPLE_RATE = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 2048 # Größere Chunks entlasten die CPU
+SEND_SAMPLE_RATE = 16000 
+CHUNK_SIZE = 1024
 
-client = genai.Client(http_options={"api_version": "v1alpha"})
-MODEL = "gemini-2.0-flash-exp" 
+api_key = os.getenv("GOOGLE_API_KEY")
+
+client = genai.Client(
+    api_key=api_key,
+    http_options={"api_version": "v1alpha"}
+)
+
+# Nur Text-Antworten anfordern
 CONFIG = {
-    "response_modalities": ["AUDIO"],
-    "system_instruction": "Du bist ein Dolmetscher. Übersetze Arabisch sofort ins Deutsche. Antworte NUR auf Deutsch.",
-    "input_audio_transcription": {},
+    "system_instruction": (
+        "Du bist ein professioneller Echtzeit-Dolmetscher. "
+        "Antworte IMMER nur mit Text auf Deutsch."
+    ),
+    "response_modalities": ["TEXT"]
 }
 
-# Queues und Audio-Instanz
-audio_queue_output = asyncio.Queue()
-audio_queue_mic = asyncio.Queue(maxsize=20)
 pya = pyaudio.PyAudio()
 
-def format_arabic(text):
-    if not text: return ""
-    return get_display(arabic_reshaper.reshape(text))
+class GeminiLiveTextOnly:
+    def __init__(self):
+        self.out_queue = asyncio.Queue(maxsize=5)
+        self.session = None
 
-# --- MULTITHREADING MIKROFON CALLBACK ---
-def mic_callback(in_data, frame_count, time_info, status):
-    """Dieser Code läuft in einem eigenen Thread von PyAudio."""
-    try:
-        # Wir nutzen die Event-Loop des Hauptthreads, um die Daten in die Queue zu schieben
-        loop.call_soon_threadsafe(audio_queue_mic.put_nowait, in_data)
-    except asyncio.QueueFull:
-        pass # Ignorieren, wenn die Queue voll ist
-    return (None, pyaudio.paContinue)
+    async def listen_mic(self):
+        """Liest Audio vom Mikrofon und sendet es an die Queue"""
+        stream = await asyncio.to_thread(
+            pya.open, format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
+            input=True, frames_per_buffer=CHUNK_SIZE
+        )
+        print("🎤 Mikrofon aktiv - Du kannst jetzt sprechen...")
+        while True:
+            data = await asyncio.to_thread(stream.read, CHUNK_SIZE, exception_on_overflow=False)
+            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
-async def send_to_gemini(session):
-    """Sendet die Daten ohne den Loop zu blockieren."""
-    while True:
-        audio_chunk = await audio_queue_mic.get()
+    async def receive_text(self):
+        """Empfängt nur die Text-Antworten von Gemini"""
+        while True:
+            async for response in self.session.receive():
+                if response.server_content and response.server_content.model_turn:
+                    for part in response.server_content.model_turn.parts:
+                        if part.text:
+                            print(f"🤖 Gemini: {part.text}")
+
+    async def send_to_gemini(self):
+        """Sendet Audio-Daten aus der Queue an Gemini"""
+        while True:
+            msg = await self.out_queue.get()
+            await self.session.send(input=msg)
+
+    async def run(self):
+        print("\n--- TEXT-ONLY MODUS ---")
+        
         try:
-            await session.send_realtime_input(
-                audio=types.Blob(data=audio_chunk, mime_type='audio/pcm;rate=16000')
-            )
-            # Ganz wichtig für websockets Stabilität:
-            await asyncio.sleep(0) 
-        except Exception:
-            break
-
-async def receive_from_gemini(session):
-    async for msg in session.receive():
-        if msg.server_content:
-            # 1. Deutsche Audio-Daten
-            if msg.server_content.model_turn:
-                for part in msg.server_content.model_turn.parts:
-                    if part.inline_data:
-                        audio_queue_output.put_nowait(part.inline_data.data)
-            
-            # 2. Arabischer Text
-            if msg.server_content.input_transcription:
-                ar_text = msg.server_content.input_transcription.text
-                if ar_text:
-                    print(f"{Fore.CYAN}🇸🇦 ARABISCH: {format_arabic(ar_text)}")
-
-async def play_audio():
-    stream = pya.open(format=FORMAT, channels=CHANNELS, rate=RECEIVE_SAMPLE_RATE, output=True)
-    while True:
-        data = await audio_queue_output.get()
-        await asyncio.to_thread(stream.write, data)
-
-async def run():
-    global loop
-    loop = asyncio.get_running_loop()
-    
-    while True:
-        try:
-            # Mikrofon-Stream mit Callback (läuft im Hintergrund-Thread)
-            mic_stream = pya.open(
-                format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
-                input=True, stream_callback=mic_callback, frames_per_buffer=CHUNK_SIZE
-            )
-            
-            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
-                print(f"{Fore.GREEN}✅ VERBUNDEN (Multithreaded Mic)!")
-                await asyncio.gather(
-                    send_to_gemini(session),
-                    receive_from_gemini(session),
-                    play_audio()
-                )
+            async with client.aio.live.connect(model="gemini-2.0-flash-exp", config=CONFIG) as session:
+                self.session = session
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.listen_mic())
+                    tg.create_task(self.send_to_gemini())
+                    tg.create_task(self.receive_text())
+                    await asyncio.Future()
         except Exception as e:
-            print(f"{Fore.RED}Fehler: {e}. Neustart...")
-            if 'mic_stream' in locals(): mic_stream.stop_stream()
-            await asyncio.sleep(2)
+            print(f"\n❌ Fehler: {e}")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run())
+        interpreter = GeminiLiveTextOnly()
+        asyncio.run(interpreter.run())
     except KeyboardInterrupt:
+        print("\nProgramm beendet.")
+    finally:
         pya.terminate()
