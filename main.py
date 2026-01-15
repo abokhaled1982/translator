@@ -1,135 +1,100 @@
 import asyncio
 import os
 import sys
+import logging
+from dotenv import load_dotenv
 
-# --- 1. SYSTEM-LOGGING SÄUBERN ---
-# Entfernt alle technischen Debug-Meldungen von Pipecat/HTTP
-from loguru import logger as system_logger
-system_logger.remove()
-system_logger.add(sys.stderr, level="CRITICAL")
-
-# --- 2. BIBLIOTHEKEN LADEN ---
-import arabic_reshaper
-from bidi.algorithm import get_display
-from colorama import Fore, Style, init
-
-from pipecat.frames.frames import TranscriptionFrame, ErrorFrame
+# Pipecat Imports
+from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.groq.stt import GroqSTTService
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 
-# Windows Terminal auf UTF-8 zwingen
-init()
-if sys.platform == "win32":
-    os.system("chcp 65001 >nul")
+# Google Typen für die Stimmen-Config
+from google.genai import types
 
-# -------------------------------------------------------------------------
-# HELPER: Arabische Schrift für Terminal fixen
-# -------------------------------------------------------------------------
-def fix_arabic_text(text):
-    """
-    Verbindet arabische Buchstaben und dreht die Leserichtung für das Terminal.
-    """
-    if not text or not text.strip():
-        return ""
-    try:
-        reshaped_text = arabic_reshaper.reshape(text)
-        bidi_text = get_display(reshaped_text)
-        return bidi_text
-    except Exception:
-        return text
+load_dotenv()
 
-# -------------------------------------------------------------------------
-# LOGGER: Professionelle Ausgabe
-# -------------------------------------------------------------------------
-class ProductionLogger(FrameProcessor):
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
+# Logging auf Warning setzen, damit die Konsole sauber bleibt (kein Info-Spam)
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
 
-        if isinstance(frame, TranscriptionFrame):
-            text = frame.text.strip()
-            if text:
-                formatted = fix_arabic_text(text)
-                # Ausgabeformat: Grün, Fett, Sauber
-                print(f"{Fore.GREEN}{Style.BRIGHT}📝 TEXT:{Style.RESET_ALL} {formatted}")
-        
-        elif isinstance(frame, ErrorFrame):
-            print(f"{Fore.RED}❌ FEHLER: {frame.error}{Style.RESET_ALL}")
+# --- 1. Spezial-Klasse für Native Speaker Audio ---
+class NativeGemini(GeminiLiveLLMService):
+    def _get_live_config(self):
+        return {
+            # WICHTIG: Wir fordern explizit nur AUDIO an (kein Text-Ballast)
+            "response_modalities": ["AUDIO"],
+            
+            "speech_config": {
+                "voice_config": {
+                    "prebuilt_voice_config": {
+                        # "Fenrir" ist aktuell die tiefste und natürlichste Stimme.
+                        # Alternativen: "Kore" (weiblich, klar), "Puck" (Standard)
+                        "voice_name": "Fenrir" 
+                    }
+                }
+            }
+        }
 
-# -------------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------------
 async def main():
-    # 1. API Key Prüfung
-    groq_key = os.getenv("GROQ_API_KEY")
-    if not groq_key:
-        print(f"{Fore.RED}FEHLER: GROQ_API_KEY fehlt in den Umgebungsvariablen.{Style.RESET_ALL}")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print("❌ API Key fehlt!")
         return
 
-    # 2. UI Header
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"{Fore.YELLOW}=======================================================")
-    print(f"   ARABIC TRANSCRIPTION ENGINE (Pro Config)")
-    print(f"   Modell: Whisper-Large-v3-Turbo | Modus: Hocharabisch")
-    print(f"======================================================={Style.RESET_ALL}\n")
-
-    # 3. VAD (Voice Activity Detection) - Tuning für Produktion
-    vad_params = VADParams(
-        confidence=0.6,      # Hohe Schwelle: Ignoriert Lüfter/Atmen
-        start_secs=0.2,      # Reagiert schnell auf Sprachbeginn
-        stop_secs=0.8,       # Wartet 0.8s Stille (Wichtig für arabische Pausen!)
-        min_volume=0.0       # Ignoriert Lautstärke, achtet nur auf Sprach-Muster
-    )
-
+    # --- 2. Audio Transport (Deine funktionierenden Settings) ---
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
-            audio_out_enabled=False, # Kein Lautsprecher nötig (nur Input)
-            audio_in_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=vad_params)
+            audio_out_enabled=True,
+            vad_enabled=True,             # VAD an = Stoppt wenn du schweigst
+            vad_analyzer=SileroVADAnalyzer(),
+            vad_audio_passthrough=True
         )
     )
 
-    # 4. STT (Groq) - Der Kern für Qualität
-    # Dieser Prompt zwingt Whisper in den "Fusha"-Modus
-    arabic_system_prompt = "اللغة العربية الفصحى. يرجى الكتابة بدقة لغوية عالية وتجنب الهلوسة. التشكيل عند الضرورة."
-    # Bedeutung: "Hocharabisch. Bitte mit hoher sprachlicher Genauigkeit schreiben und Halluzinationen vermeiden."
-
-    stt = GroqSTTService(
-        api_key=groq_key,
-        model="whisper-large-v3-turbo", # Turbo für max Geschwindigkeit
-        language="ar",                  # Sprache festlegen
-        prompt=arabic_system_prompt,    # <--- DEIN GEWÜNSCHTER PROMPT
-        temperature=0.0                 # <--- WICHTIG: 0.0 verhindert Erfindungen/Halluzinationen
+    # --- 3. Der "Native Speaker" Prompt ---
+    # Dieser Prompt verbietet Roboter-Sprache.
+    system_instruction = (
+        "Du bist ein professioneller Simultandolmetscher für Arabisch -> Deutsch."
+        "Deine Aufgabe: Höre zu und sprich die deutsche Übersetzung sofort aus."
+        
+        "REGELN FÜR DEINE STIMME:"
+        "1. Klinge wie ein echter deutscher Muttersprachler (natürlich, nicht abgelesen)."
+        "2. Übersetze den SINN, nicht Wort für Wort. Nutze natürliche Redewendungen."
+        "3. Deine Betonung soll lebendig sein."
+        "4. Sprich NIEMALS Arabisch. Wiederhole nichts. Nur Deutsch."
     )
 
-    # 5. Pipeline Aufbau
-    logger = ProductionLogger()
+    llm = NativeGemini(
+        api_key=api_key,
+        model="gemini-2.0-flash-exp",
+        system_instruction=system_instruction
+    )
 
+    # --- 4. Die reine Pipeline (Ohne Printer, ohne Text-Handler) ---
+    # Datenfluss: Mikrofon -> Gemini (Audio in, Audio out) -> Kopfhörer
     pipeline = Pipeline([
-        transport.input(), # Mikrofon
-        stt,               # Whisper AI
-        logger             # Ausgabe
+        transport.input(),
+        llm,
+        transport.output()
     ])
 
-    task = PipelineTask(
-        pipeline, 
-        params=PipelineParams(allow_interruptions=True)
-    )
-
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
     runner = PipelineRunner()
 
-    print(f"{Fore.CYAN}System bereit. Bitte sprechen... (STRG+C zum Beenden){Style.RESET_ALL}\n")
+    print("\n============================================")
+    print(" 🇩🇪 LIVE DOLMETSCHER (Nur Audio)")
+    print("============================================")
+    print("System ist bereit. Sprich Arabisch...")
+    print("(Die Konsole wird leer bleiben, höre auf den Ton)")
+    print("============================================\n")
 
     try:
         await runner.run(task)
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}Beendet.{Style.RESET_ALL}")
+        print("Beendet.")
 
 if __name__ == "__main__":
     asyncio.run(main())
