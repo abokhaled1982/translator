@@ -1,135 +1,111 @@
 import asyncio
 import os
-import sys
-
-# --- 1. SYSTEM-LOGGING SÄUBERN ---
-# Entfernt alle technischen Debug-Meldungen von Pipecat/HTTP
-from loguru import logger as system_logger
-system_logger.remove()
-system_logger.add(sys.stderr, level="CRITICAL")
-
-# --- 2. BIBLIOTHEKEN LADEN ---
+import pyaudio
+import threading
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
 import arabic_reshaper
 from bidi.algorithm import get_display
-from colorama import Fore, Style, init
+from colorama import init, Fore, Style
 
-from pipecat.frames.frames import TranscriptionFrame, ErrorFrame
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.groq.stt import GroqSTTService
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+load_dotenv()
+init(autoreset=True)
 
-# Windows Terminal auf UTF-8 zwingen
-init()
-if sys.platform == "win32":
-    os.system("chcp 65001 >nul")
+# --- KONFIGURATION ---
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE = 2048 # Größere Chunks entlasten die CPU
 
-# -------------------------------------------------------------------------
-# HELPER: Arabische Schrift für Terminal fixen
-# -------------------------------------------------------------------------
-def fix_arabic_text(text):
-    """
-    Verbindet arabische Buchstaben und dreht die Leserichtung für das Terminal.
-    """
-    if not text or not text.strip():
-        return ""
+client = genai.Client(http_options={"api_version": "v1alpha"})
+MODEL = "gemini-2.0-flash-exp" 
+CONFIG = {
+    "response_modalities": ["AUDIO"],
+    "system_instruction": "Du bist ein Dolmetscher. Übersetze Arabisch sofort ins Deutsche. Antworte NUR auf Deutsch.",
+    "input_audio_transcription": {},
+}
+
+# Queues und Audio-Instanz
+audio_queue_output = asyncio.Queue()
+audio_queue_mic = asyncio.Queue(maxsize=20)
+pya = pyaudio.PyAudio()
+
+def format_arabic(text):
+    if not text: return ""
+    return get_display(arabic_reshaper.reshape(text))
+
+# --- MULTITHREADING MIKROFON CALLBACK ---
+def mic_callback(in_data, frame_count, time_info, status):
+    """Dieser Code läuft in einem eigenen Thread von PyAudio."""
     try:
-        reshaped_text = arabic_reshaper.reshape(text)
-        bidi_text = get_display(reshaped_text)
-        return bidi_text
-    except Exception:
-        return text
+        # Wir nutzen die Event-Loop des Hauptthreads, um die Daten in die Queue zu schieben
+        loop.call_soon_threadsafe(audio_queue_mic.put_nowait, in_data)
+    except asyncio.QueueFull:
+        pass # Ignorieren, wenn die Queue voll ist
+    return (None, pyaudio.paContinue)
 
-# -------------------------------------------------------------------------
-# LOGGER: Professionelle Ausgabe
-# -------------------------------------------------------------------------
-class ProductionLogger(FrameProcessor):
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
+async def send_to_gemini(session):
+    """Sendet die Daten ohne den Loop zu blockieren."""
+    while True:
+        audio_chunk = await audio_queue_mic.get()
+        try:
+            await session.send_realtime_input(
+                audio=types.Blob(data=audio_chunk, mime_type='audio/pcm;rate=16000')
+            )
+            # Ganz wichtig für websockets Stabilität:
+            await asyncio.sleep(0) 
+        except Exception:
+            break
 
-        if isinstance(frame, TranscriptionFrame):
-            text = frame.text.strip()
-            if text:
-                formatted = fix_arabic_text(text)
-                # Ausgabeformat: Grün, Fett, Sauber
-                print(f"{Fore.GREEN}{Style.BRIGHT}📝 TEXT:{Style.RESET_ALL} {formatted}")
-        
-        elif isinstance(frame, ErrorFrame):
-            print(f"{Fore.RED}❌ FEHLER: {frame.error}{Style.RESET_ALL}")
+async def receive_from_gemini(session):
+    async for msg in session.receive():
+        if msg.server_content:
+            # 1. Deutsche Audio-Daten
+            if msg.server_content.model_turn:
+                for part in msg.server_content.model_turn.parts:
+                    if part.inline_data:
+                        audio_queue_output.put_nowait(part.inline_data.data)
+            
+            # 2. Arabischer Text
+            if msg.server_content.input_transcription:
+                ar_text = msg.server_content.input_transcription.text
+                if ar_text:
+                    print(f"{Fore.CYAN}🇸🇦 ARABISCH: {format_arabic(ar_text)}")
 
-# -------------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------------
-async def main():
-    # 1. API Key Prüfung
-    groq_key = os.getenv("GROQ_API_KEY")
-    if not groq_key:
-        print(f"{Fore.RED}FEHLER: GROQ_API_KEY fehlt in den Umgebungsvariablen.{Style.RESET_ALL}")
-        return
+async def play_audio():
+    stream = pya.open(format=FORMAT, channels=CHANNELS, rate=RECEIVE_SAMPLE_RATE, output=True)
+    while True:
+        data = await audio_queue_output.get()
+        await asyncio.to_thread(stream.write, data)
 
-    # 2. UI Header
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"{Fore.YELLOW}=======================================================")
-    print(f"   ARABIC TRANSCRIPTION ENGINE (Pro Config)")
-    print(f"   Modell: Whisper-Large-v3-Turbo | Modus: Hocharabisch")
-    print(f"======================================================={Style.RESET_ALL}\n")
-
-    # 3. VAD (Voice Activity Detection) - Tuning für Produktion
-    vad_params = VADParams(
-        confidence=0.6,      # Hohe Schwelle: Ignoriert Lüfter/Atmen
-        start_secs=0.2,      # Reagiert schnell auf Sprachbeginn
-        stop_secs=0.8,       # Wartet 0.8s Stille (Wichtig für arabische Pausen!)
-        min_volume=0.0       # Ignoriert Lautstärke, achtet nur auf Sprach-Muster
-    )
-
-    transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_out_enabled=False, # Kein Lautsprecher nötig (nur Input)
-            audio_in_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=vad_params)
-        )
-    )
-
-    # 4. STT (Groq) - Der Kern für Qualität
-    # Dieser Prompt zwingt Whisper in den "Fusha"-Modus
-    arabic_system_prompt = "اللغة العربية الفصحى. يرجى الكتابة بدقة لغوية عالية وتجنب الهلوسة. التشكيل عند الضرورة."
-    # Bedeutung: "Hocharabisch. Bitte mit hoher sprachlicher Genauigkeit schreiben und Halluzinationen vermeiden."
-
-    stt = GroqSTTService(
-        api_key=groq_key,
-        model="whisper-large-v3-turbo", # Turbo für max Geschwindigkeit
-        language="ar",                  # Sprache festlegen
-        prompt=arabic_system_prompt,    # <--- DEIN GEWÜNSCHTER PROMPT
-        temperature=0.0                 # <--- WICHTIG: 0.0 verhindert Erfindungen/Halluzinationen
-    )
-
-    # 5. Pipeline Aufbau
-    logger = ProductionLogger()
-
-    pipeline = Pipeline([
-        transport.input(), # Mikrofon
-        stt,               # Whisper AI
-        logger             # Ausgabe
-    ])
-
-    task = PipelineTask(
-        pipeline, 
-        params=PipelineParams(allow_interruptions=True)
-    )
-
-    runner = PipelineRunner()
-
-    print(f"{Fore.CYAN}System bereit. Bitte sprechen... (STRG+C zum Beenden){Style.RESET_ALL}\n")
-
-    try:
-        await runner.run(task)
-    except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}Beendet.{Style.RESET_ALL}")
+async def run():
+    global loop
+    loop = asyncio.get_running_loop()
+    
+    while True:
+        try:
+            # Mikrofon-Stream mit Callback (läuft im Hintergrund-Thread)
+            mic_stream = pya.open(
+                format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
+                input=True, stream_callback=mic_callback, frames_per_buffer=CHUNK_SIZE
+            )
+            
+            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
+                print(f"{Fore.GREEN}✅ VERBUNDEN (Multithreaded Mic)!")
+                await asyncio.gather(
+                    send_to_gemini(session),
+                    receive_from_gemini(session),
+                    play_audio()
+                )
+        except Exception as e:
+            print(f"{Fore.RED}Fehler: {e}. Neustart...")
+            if 'mic_stream' in locals(): mic_stream.stop_stream()
+            await asyncio.sleep(2)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pya.terminate()
