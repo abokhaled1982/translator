@@ -4,60 +4,64 @@ import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from livekit import agents, api
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
-    AutoSubscribe,
-)
+# --- FIX FÜR DEN CIRCULAR IMPORT ---
+# 1. Wir importieren 'api' ganz normal
+from livekit import api
+
+# 2. WICHTIG: Wir importieren 'agents' als Modul-Alias!
+# Das verhindert, dass Python durcheinander kommt.
+import livekit.agents as agents
+
+# 3. Wir holen Agent und Session direkt aus dem Untermodul 'voice'
+from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import google
 
 load_dotenv()
 load_dotenv(".env.local")
 
-logger = logging.getLogger("gemini-translator")
+logger = logging.getLogger("gemini-stt-only")
 logger.setLevel(logging.INFO)
+
+def get_current_time_str():
+    try:
+        return datetime.now(timezone.utc).strftime("%H:%M")
+    except Exception:
+        return "Zeit unbekannt"
 
 class Assistant(Agent):
     def __init__(self):
         super().__init__(instructions="Du bist ein Dolmetscher.")
 
-async def entrypoint(ctx: JobContext):
+# Beachte: Wir nutzen jetzt 'agents.JobContext' (durch den Alias oben)
+async def entrypoint(ctx: agents.JobContext):
     logger.info(f"Verbinde mit Raum: {ctx.room.name}")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    # Wir nutzen 'agents.AutoSubscribe'
+    await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
 
-    # --- DIE MAGIE IST HIER ---
-    # Wir geben Gemini strikte Anweisungen, nur zu übersetzen.
-    instructions = """
-        Du bist ein professioneller Simultandolmetscher.
-        Deine Aufgabe:
-        1. Höre genau zu, was der Nutzer sagt (meistens auf Arabisch).
-        2. Übersetze das Gesagte SOFORT und DIREKT ins Deutsche.
-        3. Antworte NICHT auf Fragen. Führe KEINE Unterhaltung.
-        4. Gib NUR die deutsche Übersetzung aus.
-        
-        Beispiel:
-        Nutzer (Arabisch): "Marhaban, kayfa haluka?"
-        Du (Deutsch): "Hallo, wie geht es dir?"
-    """
+    time_str = get_current_time_str()
 
+    # --- GEMINI KONFIGURATION (STUMM / NUR TEXT) ---
     model = google.beta.realtime.RealtimeModel(
         model="gemini-2.0-flash-exp",
         api_key=os.getenv("GOOGLE_API_KEY"),
         voice="Puck",
-        instructions=instructions,
+        
+        # Audio ausschalten -> Nur Text in Konsole
+        modalities=["text"],
+        
+        instructions=f"""
+            Du bist ein Dolmetscher. Es ist {time_str}.
+            1. Höre den arabischen Input.
+            2. Übersetze SOFORT ins Deutsche.
+            3. Gib NUR Text aus. Generiere KEIN Audio.
+        """,
     )
 
-    # 1. Agent erstellen
     my_agent = Assistant()
-
-    # 2. Session erstellen
     session = AgentSession(llm=model)
 
-    # 3. Event Listener für die Konsole
+    # Event Listener für die Konsole
     @session.on("conversation_item_added")
     def on_item(event):
         item = getattr(event, 'item', event)
@@ -71,17 +75,15 @@ async def entrypoint(ctx: JobContext):
                 text = item.content
         
         if text:
-            # Wir formatieren die Ausgabe schön
-            if item.role == "user":
-                print(f"\n🇸🇦 ARABISCH (gehört): {text}")
-            elif item.role == "assistant":
-                print(f"🇩🇪 DEUTSCH (Übersetzung): {text}")
+            role_icon = "🗣️ DU" if item.role == "user" else "🤖 GEMINI"
+            print(f"\n{role_icon}: {text}")
 
-    # 4. Starten
+    # Starten (Signatur: Agent zuerst, dann Raum benannt)
     await session.start(my_agent, room=ctx.room)
     
-    # Kurze Info an dich (wird gesprochen)
-    await session.generate_reply(instructions="Sag kurz auf Deutsch: 'Ich bin bereit zum Übersetzen.'")
+    # Initiale Nachricht (nur Text im Log)
+    await session.generate_reply()
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # Wir nutzen den Alias 'agents.' für cli und WorkerOptions
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))

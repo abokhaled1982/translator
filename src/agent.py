@@ -4,15 +4,16 @@ import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from livekit import agents, api
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
-    AutoSubscribe,
-)
+# --- FIX FÜR DEN CIRCULAR IMPORT ---
+# 1. Wir importieren 'api' ganz normal
+from livekit import api
+
+# 2. WICHTIG: Wir importieren 'agents' als Modul-Alias!
+# Das verhindert, dass Python durcheinander kommt.
+import livekit.agents as agents
+
+# 3. Wir holen Agent und Session direkt aus dem Untermodul 'voice'
+from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import google
 # from google.genai import types # Brauchen wir jetzt nicht mehr
 
@@ -32,9 +33,12 @@ class Assistant(Agent):
     def __init__(self):
         super().__init__(instructions="Du bist ein hilfreicher Assistent.")
 
-async def entrypoint(ctx: JobContext):
+# FEHLER 1 BEHOBEN: Hier muss 'agents.JobContext' stehen
+async def entrypoint(ctx: agents.JobContext):
     logger.info(f"Verbinde mit Raum: {ctx.room.name}")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    # FEHLER 2 BEHOBEN: Hier muss 'agents.AutoSubscribe' stehen
+    await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
 
     time_str = get_current_time_str()
 
@@ -77,4 +81,5 @@ async def entrypoint(ctx: JobContext):
     await session.generate_reply()
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # FEHLER 3 & 4 BEHOBEN: Hier muss 'agents.cli' und 'agents.WorkerOptions' stehen
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
