@@ -6,12 +6,13 @@ from dotenv import load_dotenv
 from livekit import api
 import livekit.agents as agents
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import google, elevenlabs 
+# Wir brauchen Silero für die Präzision (VAD)
+from livekit.plugins import google, elevenlabs, silero
 
 load_dotenv()
 load_dotenv(".env.local")
 
-logger = logging.getLogger("gemini-elevenlabs-hybrid")
+logger = logging.getLogger("gemini-translator-strict")
 logger.setLevel(logging.INFO)
 
 class Assistant(Agent):
@@ -20,38 +21,48 @@ class Assistant(Agent):
 
 async def entrypoint(ctx: agents.JobContext):
     logger.info(f"Verbinde mit Raum: {ctx.room.name}")
+    
+    # WICHTIG: Echo Cancellation auf dem Client (Frontend) ist wichtig!
+    # Aber hier aktivieren wir Audio.
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
 
-    # 1. GEHIRN: Gemini (Nur Text Modus)
+    # 1. GEHIRN: Gemini (Streng konfigurierter Prompt)
     llm_model = google.beta.realtime.RealtimeModel(
         model="gemini-2.0-flash-exp",
         api_key=os.getenv("GOOGLE_API_KEY"),
-        modalities=["text"], 
+        modalities=["text"], # Nur Text zurück, damit ElevenLabs spricht
         instructions="""
-            Du bist ein Dolmetscher.
-            1. Höre den arabischen Input.
-            2. Übersetze SOFORT ins Deutsche.
-            3. Gib NUR den deutschen Text zurück.
+            SYSTEM INSTRUKTION:
+            Du bist KEIN Chatbot. Du bist eine reine Übersetzungs-API.
+            
+            DEINE REGELN:
+            1. Input: Arabische Sprache (vom Nutzer).
+            2. Output: Deutsche Übersetzung (Text).
+            3. Verhalten:
+               - Übersetze SOFORT und PRÄZISE.
+               - Füge KEINE Einleitungen hinzu (wie "Hier ist die Übersetzung").
+               - Wenn der Input unverständlich ist oder nur Rauschen: Gib LEEREN Text zurück.
+               - WIEDERHOLE NIEMALS den arabischen Input.
+               - WIEDERHOLE NIEMALS deine eigene vorherige Übersetzung.
+               - Wenn der Input Deutsch ist, ignoriere ihn (um Echos zu vermeiden).
         """,
     )
 
-    # 2. MUND: ElevenLabs TTS (Korrigiert für deine Version)
+    # 2. MUND: ElevenLabs
     eleven_tts = elevenlabs.TTS(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
-        
-        # KORREKTUR 1: 'model' statt 'model_id'
         model="eleven_turbo_v2_5", 
-        
-        # KORREKTUR 2: 'voice_id' (String) statt 'voice' (Objekt)
-        voice_id="JBFqnCBsd6RMkjVDRZzb" # Das ist die ID für "George"
+        voice_id="JBFqnCBsd6RMkjVDRZzb" # George
     )
 
     my_agent = Assistant()
 
-    # 3. SESSION
+    # 3. SESSION: Mit VAD (Voice Activity Detection)
+    # Das VAD hilft, Pausen zu erkennen und verhindert, dass Rauschen übersetzt wird.
     session = AgentSession(
         llm=llm_model,
-        tts=eleven_tts
+        tts=eleven_tts,
+        vad=silero.VAD.load() # <-- WICHTIG: Filtert Atemgeräusche und Rauschen weg
     )
 
     # --- CONSOLE PRINT ---
@@ -68,12 +79,14 @@ async def entrypoint(ctx: agents.JobContext):
         
         if text:
             if item.role == "user":
-                print(f"\n🎤 GEHÖRT: {text}")
+                print(f"\n🎤 INPUT: {text}")
             elif item.role == "assistant":
-                print(f"🤖 ÜBERSETZUNG (ElevenLabs): {text}")
+                print(f"🇩🇪 OUTPUT: {text}")
 
     await session.start(my_agent, room=ctx.room)
-    await session.generate_reply(instructions="Sag freundlich auf Deutsch: 'Ich bin bereit.'")
+    
+    # Keine Begrüßung mehr, um Wiederholungen beim Start zu vermeiden.
+    # Der Agent wartet still auf Input.
 
 if __name__ == "__main__":
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
