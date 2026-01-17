@@ -10,7 +10,7 @@ from livekit.agents.voice import Agent, AgentSession
 from livekit.plugins import google, elevenlabs, silero
 
 load_dotenv()
-load_dotenv(".env.local")
+load_dotenv(".env")
 
 logger = logging.getLogger("gemini-translator-strict")
 logger.setLevel(logging.INFO)

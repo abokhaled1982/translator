@@ -20,7 +20,7 @@ from livekit.plugins import google  # noise_cancellation disabled for testing
 
 logger = logging.getLogger("gemini-telephony-agent")
 
-load_dotenv(".env.local")
+load_dotenv(".env")
 
 # Webhook for end-of-call reports (set in .env.local)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")

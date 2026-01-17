@@ -18,7 +18,7 @@ from livekit.plugins import google
 # --- FIX ENDE ---
 
 load_dotenv()
-load_dotenv(".env.local")
+load_dotenv(".env")
 
 logger = logging.getLogger("gemini-translator")
 logger.setLevel(logging.INFO)

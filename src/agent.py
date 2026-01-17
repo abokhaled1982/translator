@@ -18,7 +18,7 @@ from livekit.plugins import google
 # from google.genai import types # Brauchen wir jetzt nicht mehr
 
 load_dotenv()
-load_dotenv(".env.local")
+load_dotenv(".env")
 
 logger = logging.getLogger("gemini-agent")
 logger.setLevel(logging.INFO)
