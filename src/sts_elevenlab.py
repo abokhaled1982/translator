@@ -57,12 +57,18 @@ async def entrypoint(ctx: agents.JobContext):
 
     my_agent = Assistant()
 
+    vad_plugin = silero.VAD.load(
+        min_silence_duration=0.4, # <--- 0.2 Sekunden (200ms) Stille = Satzende
+        min_speech_duration=0.1,  # Erkennt auch kurze Wörter ("Ja", "Nein")
+        prefix_padding_duration=0.05
+    )
+
     # 3. SESSION: Mit VAD (Voice Activity Detection)
     # Das VAD hilft, Pausen zu erkennen und verhindert, dass Rauschen übersetzt wird.
     session = AgentSession(
         llm=llm_model,
         tts=eleven_tts,
-        vad=silero.VAD.load() # <-- WICHTIG: Filtert Atemgeräusche und Rauschen weg
+        vad=vad_plugin
     )
 
     # --- CONSOLE PRINT ---
