@@ -205,7 +205,7 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("user_input_transcribed")
     def on_user_input(event):
         # Wenn der User spricht -> Bot sofort unterbrechen
-        speaker.interrupt()
+        #speaker.interrupt()
         print(f"🎤 [USER] {event.transcript}")
 
     @session.on("conversation_item_added")
