@@ -11,7 +11,7 @@ import logging
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 
-from src.process_recording import handle_egress_webhook
+from src.archive.process_recording import handle_egress_webhook
 
 load_dotenv(".env.local")
 
