@@ -1,85 +1,109 @@
+"""
+agent.py — SalesAssistant und Session-Lifecycle.
+
+Trennung von Verantwortlichkeiten:
+  - SalesAssistant: nur Persönlichkeit + Tools
+  - build_session():  nur technische Konfiguration (Modell, VAD)
+  - entrypoint():     nur LiveKit-Verbindung + Lifecycle
+"""
 import logging
-import os
-import asyncio
-from datetime import datetime, timezone
-from dotenv import load_dotenv
 
-# --- FIX FÜR DEN CIRCULAR IMPORT ---
-# 1. Wir importieren 'api' ganz normal
-from livekit import api
-
-# 2. WICHTIG: Wir importieren 'agents' als Modul-Alias!
-# Das verhindert, dass Python durcheinander kommt.
-import livekit.agents as agents
-
-# 3. Wir holen Agent und Session direkt aus dem Untermodul 'voice'
+from livekit.agents import JobContext, AutoSubscribe
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import google
-# from google.genai import types # Brauchen wir jetzt nicht mehr
+from livekit.plugins import google, silero
 
-load_dotenv()
-load_dotenv(".env")
+from config import CONFIG
+from tools import AppointmentTools
 
-logger = logging.getLogger("gemini-agent")
-logger.setLevel(logging.INFO)
+logger = logging.getLogger("intraunit.agent")
 
-def get_current_time_str():
-    try:
-        return datetime.now(timezone.utc).strftime("%H:%M Uhr (UTC)")
-    except Exception:
-        return "Unbekannte Zeit"
 
-class Assistant(Agent):
-    def __init__(self):
-        super().__init__(instructions="Du bist ein hilfreicher Assistent.")
+class SalesAssistant(Agent, AppointmentTools):
+    """
+    Intraunit Vertriebs-Assistent.
+    Erbt Agent (LiveKit) + AppointmentTools (Function-Tools).
+    Durch Mehrfachvererbung werden alle @llm.function_tool-Methoden
+    automatisch vom LLM erkannt — keine manuelle Registrierung nötig.
+    """
 
-# FEHLER 1 BEHOBEN: Hier muss 'agents.JobContext' stehen
-async def entrypoint(ctx: agents.JobContext):
-    logger.info(f"Verbinde mit Raum: {ctx.room.name}")
-    
-    # FEHLER 2 BEHOBEN: Hier muss 'agents.AutoSubscribe' stehen
-    await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
+    def __init__(self) -> None:
+        Agent.__init__(self, instructions=CONFIG.agent.system_prompt)
+        logger.debug("SalesAssistant initialisiert")
 
-    time_str = get_current_time_str()
 
-    # --- GEMINI KONFIGURATION ---
-    # Fix: thinking_config wurde entfernt!
-    model = google.realtime.RealtimeModel(
-        model="gemini-2.5-flash-native-audio-preview-12-2025",
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        voice="Puck",
-        instructions=f"Du bist ein Assistent. Es ist {time_str}. Fasse dich kurz.",
+def _build_model() -> google.realtime.RealtimeModel:
+    """Erstellt das Gemini Realtime-Modell mit optimierten Parametern."""
+    return google.realtime.RealtimeModel(
+        model=CONFIG.voice.model,
+        api_key=CONFIG.google_api_key,
+        voice=CONFIG.voice.voice,
+        temperature=CONFIG.voice.temperature,
     )
 
-    # 1. Agent erstellen
-    my_agent = Assistant()
 
-    # 2. Session erstellen
-    session = AgentSession(llm=model)
+def _build_vad() -> silero.VAD:
+    """
+    Erstellt den Voice Activity Detector.
+    Niedrige Schwellwerte = minimale Latenz zwischen Sprechen und Antwort.
+    """
+    return silero.VAD.load(
+        min_silence_duration=CONFIG.vad.min_silence_duration,
+        min_speech_duration=CONFIG.vad.min_speech_duration,
+    )
 
-    # 3. Event Listener für STT
+
+def _build_session() -> AgentSession:
+    """Erstellt eine fertig konfigurierte AgentSession."""
+    return AgentSession(
+        llm=_build_model(),
+        vad=_build_vad(),
+    )
+
+
+def _attach_dev_console(session: AgentSession) -> None:
+    """
+    Gibt Konversation im Terminal aus — ausschließlich im DEV-Modus.
+    In PROD: diese Funktion wird gar nicht aufgerufen.
+    """
     @session.on("conversation_item_added")
-    def on_item(event):
-        item = getattr(event, 'item', event)
+    def _on_item(event) -> None:
+        item = getattr(event, "item", event)
         text = ""
-        if hasattr(item, 'content'):
+
+        if hasattr(item, "content"):
             if isinstance(item.content, list):
                 for part in item.content:
-                    if hasattr(part, 'text'): text += part.text
-                    elif isinstance(part, str): text += part
+                    if hasattr(part, "text"):
+                        text += part.text
+                    elif isinstance(part, str):
+                        text += part
             elif isinstance(item.content, str):
                 text = item.content
-        
+
         if text:
-            role_icon = "🗣️ DU" if item.role == "user" else "🤖 GEMINI"
-            print(f"\n{role_icon}: {text}")
+            icon = "🗣️  DU" if item.role == "user" else "🤖 AGENT"
+            print(f"\n{icon}: {text}", flush=True)
 
-    # 4. STARTEN
-    # Korrekte Signatur: erst Agent, dann Raum als Keyword-Argument
-    await session.start(my_agent, room=ctx.room)
-    
-    await session.generate_reply()
 
-if __name__ == "__main__":
-    # FEHLER 3 & 4 BEHOBEN: Hier muss 'agents.cli' und 'agents.WorkerOptions' stehen
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+async def entrypoint(ctx: JobContext) -> None:
+    """
+    LiveKit Job-Entrypoint.
+    Verbindet mit dem Room, baut Session auf, startet den Agenten.
+    """
+    logger.info(f"Session startet in Room: {ctx.room.name!r}")
+
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    assistant = SalesAssistant()
+    session = _build_session()
+
+    # Konsolenausgabe nur im DEV-Modus
+    if CONFIG.mode == "DEV":
+        _attach_dev_console(session)
+
+    await session.start(assistant, room=ctx.room)
+
+    # Sofortige Begrüßung — kein Warten auf Kundeninitiative
+    await session.generate_reply(instructions=CONFIG.agent.greeting)
+
+    logger.info("Session aktiv, Agent bereit")
