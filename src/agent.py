@@ -44,8 +44,8 @@ async def entrypoint(ctx: agents.JobContext):
 
     # --- GEMINI KONFIGURATION ---
     # Fix: thinking_config wurde entfernt!
-    model = google.beta.realtime.RealtimeModel(
-        model="gemini-2.0-flash-exp",
+    model = google.realtime.RealtimeModel(
+        model="gemini-2.5-flash-native-audio-preview-12-2025",
         api_key=os.getenv("GOOGLE_API_KEY"),
         voice="Puck",
         instructions=f"Du bist ein Assistent. Es ist {time_str}. Fasse dich kurz.",
