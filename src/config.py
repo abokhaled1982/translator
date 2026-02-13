@@ -18,8 +18,8 @@ class VoiceConfig:
 
 @dataclass(frozen=True)
 class VADConfig:
-    min_silence_duration: float = 0.35   # Sekunden Stille bis Antwort startet
-    min_speech_duration: float = 0.08    # Mindest-Sprechdauer zur Erkennung
+    min_silence_duration: float = 0.25   # Sekunden Stille bis Antwort startet
+    min_speech_duration: float = 0.15    # Mindest-Sprechdauer zur Erkennung
     prefix_padding_duration: float = 0.1 # Audio-Puffer vor Sprache
 
 
@@ -40,6 +40,8 @@ class AgentConfig:
         "\n- Bei technischen Fragen: 'Das klärt unser Spezialist im Termin – kein Problem.'"
         "\n- Niemals Fakten erfinden. Niemals zögern."
         "\n- Wenn ein Termin gebucht ist: Bestätige Datum, Uhrzeit und Name präzise."
+        "\n- WICHTIG: Wenn der Kunde das Thema wechselt (z.B. eine Frage stellt statt ein Datum zu nennen), "
+        "brich den Buchungsvorgang sofort ab und beantworte die Frage. Rufe KEINE Funktion auf, wenn Informationen fehlen."
     )
 
     greeting: str = (
