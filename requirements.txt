@@ -1,0 +1,17 @@
+# Core Framework & RTC
+livekit >= 0.15.0
+livekit-agents >= 0.8.0
+livekit-api >= 0.6.0
+
+# Plugins (Gemini, ElevenLabs, Silero VAD)
+livekit-plugins-google >= 0.4.0
+livekit-plugins-elevenlabs >= 0.4.0
+livekit-plugins-silero >= 0.4.0
+
+# Audio & Math
+numpy >= 1.24.0
+sounddevice >= 0.4.6
+
+# Utilities
+python-dotenv >= 1.0.0
+asyncio
