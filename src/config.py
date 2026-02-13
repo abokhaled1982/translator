@@ -1,6 +1,10 @@
 """
 config.py — Zentrale Konfiguration für den Intraunit Voice Agent.
 Alle Einstellungen an einem Ort. Keine hardcodierten Werte im Code.
+
+Änderungen gegenüber Original:
+  - SilenceHandlerConfig hinzugefügt (Stille-Erkennung in agent.py)
+  - LIVEKIT_URL in validate() geprüft
 """
 import os
 from dataclasses import dataclass, field
@@ -24,11 +28,21 @@ class VADConfig:
 
 
 @dataclass(frozen=True)
+class SilenceHandlerConfig:
+    """
+    Steuert das Verhalten bei Nutzerstille oder unverständlicher Eingabe.
+    Der Agent wiederholt die letzte Frage, bevor er das Gespräch beendet.
+    """
+    timeout_s: float = 8.0       # Wartezeit (Sek.) bevor erste Wiederholung
+    max_repeats: int = 2          # Max. Wiederholungen vor Verabschiedung
+    repeat_delay_s: float = 0.4   # Kurze Pause nach letzter Audio-Ausgabe
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     company_name: str = "Intraunit"
     agent_name: str = "digitaler Vertriebs-Assistent"
 
-    # System-Prompt: kompakt, handlungsorientiert
     system_prompt: str = (
         "Du bist der digitale Vertriebs-Assistent von Intraunit. "
         "Deine Aufgabe: Kunden professionell beraten und Termine buchen. "
@@ -64,6 +78,7 @@ class AppConfig:
 
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     vad: VADConfig = field(default_factory=VADConfig)
+    silence: SilenceHandlerConfig = field(default_factory=SilenceHandlerConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
 
@@ -72,6 +87,8 @@ class AppConfig:
         missing = []
         if not self.google_api_key:
             missing.append("GOOGLE_API_KEY")
+        if not self.livekit_url:
+            missing.append("LIVEKIT_URL")
         if missing:
             raise EnvironmentError(f"Fehlende Umgebungsvariablen: {', '.join(missing)}")
 
