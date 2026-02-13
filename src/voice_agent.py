@@ -1,91 +1,133 @@
 import logging
 import os
 import asyncio
+import json
 from datetime import datetime, timezone
+from typing import Annotated
 from dotenv import load_dotenv
 
-# --- FIX FÜR DEN CIRCULAR IMPORT ---
-# 1. Wir importieren 'api' ganz normal
-from livekit import api
-
-# 2. WICHTIG: Wir importieren 'agents' als Modul-Alias!
-# Das verhindert, dass Python durcheinander kommt.
-import livekit.agents as agents
-
-# 3. Wir holen Agent und Session direkt aus dem Untermodul 'voice'
+# LiveKit Core & Plugins
+from livekit.agents import (
+    JobContext, 
+    WorkerOptions, 
+    cli, 
+    AutoSubscribe, 
+    llm, 
+    function_tool, 
+    RunContext
+)
 from livekit.agents.voice import Agent, AgentSession
-from livekit.plugins import google,silero
-# from google.genai import types # Brauchen wir jetzt nicht mehr
+from livekit.plugins import google, silero
 
 load_dotenv()
-load_dotenv(".env")
 
-logger = logging.getLogger("gemini-agent")
-logger.setLevel(logging.INFO)
+# --- LOGGING KONFIGURATION ---
+# Wir nutzen Umgebungsvariablen für den Modus
+APP_MODE = os.getenv("APP_MODE", "DEV").upper()
+log_level = logging.INFO if APP_MODE == "PROD" else logging.DEBUG
 
-def get_current_time_str():
-    try:
-        return datetime.now(timezone.utc).strftime("%H:%M Uhr (UTC)")
-    except Exception:
-        return "Unbekannte Zeit"
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("voice-agent")
 
-class Assistant(Agent):
+from typing import Annotated
+from livekit.agents import llm, function_tool, RunContext
+
+class MyAssistant(Agent):
     def __init__(self):
-        super().__init__(instructions="Du bist ein hilfreicher Assistent.")
+        super().__init__(
+            instructions=(
+                "Du bist ein Termin-Assistent für Intraunit. "
+                "Deine Aufgabe ist es, Termine freundlich entgegenzunehmen. "
+                "Frage aktiv nach dem Namen, dem gewünschten Datum und der Uhrzeit. "
+                "Bestätige am Ende alle Daten, bevor du die Reservierung buchst."
+            )
+        )
 
-# FEHLER 1 BEHOBEN: Hier muss 'agents.JobContext' stehen
-async def entrypoint(ctx: agents.JobContext):
-    logger.info(f"Verbinde mit Raum: {ctx.room.name}")
+    @llm.function_tool
+    async def reserve_appointment(
+        self,
+        context: RunContext,
+        name: Annotated[str, "Der vollständige Name des Kunden"],
+        date: Annotated[str, "Das Datum des Termins (z.B. 2024-05-20)"],
+        time: Annotated[str, "Die Uhrzeit des Termins (z.B. 14:30)"],
+    ):
+        """
+        Diese Funktion wird aufgerufen, um einen Termin final zu buchen, 
+        nachdem der Nutzer alle Daten bestätigt hat.
+        """
+        logger.info(f"Reservierung wird verarbeitet: {name} am {date} um {time}")
+        
+        # Hier simulieren wir den Versand an die E-Mail
+        target_email = "info@intraunit.de"
+        
+        # Simulation einer Datenbank/API-Logik
+        success_message = (
+            f"Termin für {name} am {date} um {time} wurde erfolgreich im System vermerkt. "
+            f"Eine Bestätigung wurde intern an {target_email} gesendet."
+        )
+        
+        # Du könntest hier auch session.say() nutzen, aber der Return-Wert 
+        # wird von Gemini automatisch in die Antwort eingebaut.
+        return success_message
+
+    @llm.function_tool
+    async def check_availability(
+        self,
+        context: RunContext,
+        date: Annotated[str, "Das angefragte Datum"],
+    ):
+        """Prüft, ob an einem bestimmten Tag noch Termine frei sind."""
+        # Simulation: Sonntags ist immer zu
+        if "sonntag" in date.lower():
+            return "Leider haben wir am Sonntag geschlossen."
+        
+        return f"Am {date} sind aktuell noch Termine am Vormittag und Nachmittag frei."
+async def entrypoint(ctx: JobContext):
+    logger.info(f"--- Starte Agent im {APP_MODE} Modus ---")
     
-    # FEHLER 2 BEHOBEN: Hier muss 'agents.AutoSubscribe' stehen
-    await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
-
-    time_str = get_current_time_str()
-
-    # --- GEMINI KONFIGURATION ---
-    # Fix: thinking_config wurde entfernt!
+    # Verbindung zum Raum herstellen
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    # Gemini Realtime Model Setup
     model = google.realtime.RealtimeModel(
-        model="gemini-2.5-flash-native-audio-preview-12-2025",
+        model="gemini-2.5-flash-native-audio-preview-12-2025", # oder deine spezifische Version
         api_key=os.getenv("GOOGLE_API_KEY"),
         voice="Puck",
-        instructions=f"Du bist ein Assistent. Es ist {time_str}. Fasse dich kurz.",
-        
     )
 
+    # Voice Activity Detection (VAD)
     vad = silero.VAD.load(
         min_silence_duration=0.5,
         min_speech_duration=0.2,
     )
 
-    # 1. Agent erstellen
-    my_agent = Assistant()
+    # Agent und Session initialisieren
+    my_agent = MyAssistant()
+    session = AgentSession(llm=model, vad=vad)
 
-    # 2. Session erstellen
-    session = AgentSession(llm=model,vad=vad)
-
-    # 3. Event Listener für STT
+    # Konsolen-Output für die Unterhaltung
     @session.on("conversation_item_added")
     def on_item(event):
-        item = getattr(event, 'item', event)
-        text = ""
-        if hasattr(item, 'content'):
-            if isinstance(item.content, list):
-                for part in item.content:
-                    if hasattr(part, 'text'): text += part.text
-                    elif isinstance(part, str): text += part
-            elif isinstance(item.content, str):
-                text = item.content
-        
-        if text:
-            role_icon = "🗣️ DU" if item.role == "user" else "🤖 GEMINI"
-            print(f"\n{role_icon}: {text}")
+        # Wir nutzen das Event-Objekt um den Text zu extrahieren
+        if hasattr(event, 'item') and event.item.role == "user":
+            logger.info(f"🗣️ Nutzer: {event.item.content}")
+        elif hasattr(event, 'item') and event.item.role == "assistant":
+            logger.info(f"🤖 Agent: {event.item.content}")
 
-    # 4. STARTEN
-    # Korrekte Signatur: erst Agent, dann Raum als Keyword-Argument
+    # Start der Session
     await session.start(my_agent, room=ctx.room)
     
-    await session.generate_reply()
+    # Proaktive Begrüßung beim Beitreten
+   # Ersetze:
+# await session.say("Hallo! Ich bin dein neuer Voice Agent. Wie kann ich dir heute helfen?")
+
+# Durch:
+    await session.generate_reply(
+        instructions="Begrüße den Nutzer kurz und frage, wie du helfen kannst."
+    )
 
 if __name__ == "__main__":
-    # FEHLER 3 & 4 BEHOBEN: Hier muss 'agents.cli' und 'agents.WorkerOptions' stehen
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
