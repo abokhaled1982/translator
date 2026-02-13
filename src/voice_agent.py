@@ -14,8 +14,7 @@ from livekit.agents import (
     WorkerOptions, 
     cli, 
     AutoSubscribe, 
-    llm, 
-    function_tool, 
+    llm,    
     RunContext
 )
 from livekit.agents.voice import Agent, AgentSession
