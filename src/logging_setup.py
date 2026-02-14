@@ -1,21 +1,26 @@
 """
-logging_setup.py — Strukturiertes Logging.
-PROD: JSON (maschinenlesbar, kein stdout-Rauschen)
-DEV:  Lesbares Format mit Farben
+logging_setup.py — Non-Blocking High-Performance Logging.
+
+Optimierung:
+  - Nutzt QueueHandler und QueueListener.
+  - Der Main-Loop (Asyncio) wird NICHT durch I/O (print/write) blockiert.
+  - Logs werden in einen separaten Thread ausgelagert.
 """
 import json
 import logging
-import os
+import logging.handlers
+import queue
 import sys
+import atexit
 
+# Globale Referenz für den Listener, damit er nicht Garbage-collected wird
+_listener = None
 
 class _JsonFormatter(logging.Formatter):
-    """Kompaktes JSON-Format für PROD / Log-Aggregatoren (Datadog, CloudWatch etc.)."""
-
     def format(self, record: logging.LogRecord) -> str:
-        entry: dict = {
-            "ts": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
+        entry = {
+            "ts": self.formatTime(record, datefmt="%H:%M:%S"),
+            "lvl": record.levelname,
             "msg": record.getMessage(),
             "mod": record.module,
         }
@@ -23,16 +28,10 @@ class _JsonFormatter(logging.Formatter):
             entry["exc"] = self.formatException(record.exc_info)
         return json.dumps(entry, ensure_ascii=False)
 
-
 class _DevFormatter(logging.Formatter):
-    """Farbiges, lesbares Format für die Entwicklungskonsole."""
-
     COLORS = {
-        "DEBUG":    "\033[36m",   # Cyan
-        "INFO":     "\033[32m",   # Grün
-        "WARNING":  "\033[33m",   # Gelb
-        "ERROR":    "\033[31m",   # Rot
-        "CRITICAL": "\033[35m",   # Magenta
+        "DEBUG": "\033[36m", "INFO": "\033[32m",
+        "WARNING": "\033[33m", "ERROR": "\033[31m", "CRITICAL": "\033[35m",
     }
     RESET = "\033[0m"
 
@@ -41,38 +40,42 @@ class _DevFormatter(logging.Formatter):
         record.levelname = f"{color}{record.levelname:<8}{self.RESET}"
         return super().format(record)
 
-
 def setup_logging(mode: str) -> logging.Logger:
-    """
-    Richtet Logging ein und gibt den App-Logger zurück.
-    Unterdrückt noisy Third-Party-Logger (livekit, httpx, websockets).
-    """
-    logger = logging.getLogger("intraunit")
-    logger.handlers.clear()
-    logger.propagate = False
+    global _listener
+    
+    root_logger = logging.getLogger()
+    root_logger.handlers = [] # Bestehende Handler löschen
 
-    handler = logging.StreamHandler()
-
+    # 1. Das eigentliche Ziel (Konsole/Stdout)
+    console_handler = logging.StreamHandler(sys.stdout)
     if mode == "PROD":
-        logger.setLevel(logging.INFO)
-        handler.stream = sys.stdout
-        handler.setFormatter(_JsonFormatter())
-
-        # PROD: stdout nach dem Logger-Setup auf /dev/null — kein print()-Rauschen
-        import io
-        sys.stdout = io.TextIOWrapper(open(os.devnull, "wb"))
-
+        root_logger.setLevel(logging.INFO)
+        console_handler.setFormatter(_JsonFormatter())
     else:
-        logger.setLevel(logging.DEBUG)
-        handler.setFormatter(_DevFormatter(
+        root_logger.setLevel(logging.DEBUG)
+        console_handler.setFormatter(_DevFormatter(
             fmt="%(asctime)s %(levelname)s %(name)s › %(message)s",
-            datefmt="%H:%M:%S",
+            datefmt="%H:%M:%S"
         ))
 
-    logger.addHandler(handler)
+    # 2. Die Queue (Puffer)
+    log_queue = queue.Queue(-1) # Unendliche Größe
 
-    # Noisy Libraries dämpfen
-    for noisy in ("livekit", "httpx", "httpcore", "websockets", "asyncio"):
+    # 3. Der Handler für den Main-Thread (wirft nur in Queue -> extrem schnell)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    root_logger.addHandler(queue_handler)
+
+    # 4. Der Listener (Hintergrund-Thread, der die Queue abarbeitet)
+    _listener = logging.handlers.QueueListener(log_queue, console_handler)
+    _listener.start()
+
+    # Sicherstellen, dass beim Beenden alles geschrieben wird
+    atexit.register(_listener.stop)
+
+    # Dämpfung von Third-Party Libraries
+    for noisy in ("livekit", "httpx", "httpcore", "websockets", "asyncio", "google"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    logger = logging.getLogger("intraunit")
+    logger.info(f"🚀 Threaded Logging gestartet ({mode})")
     return logger
