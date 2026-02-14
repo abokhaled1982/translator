@@ -13,7 +13,7 @@ load_dotenv()
 class VoiceConfig:
     model: str = field(
         default_factory=lambda: os.getenv(
-            "GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-09-2025"
+            "GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest"
         )
     )
     voice: str = field(default_factory=lambda: os.getenv("GEMINI_VOICE", "Aoede"))
