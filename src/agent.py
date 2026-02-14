@@ -1,8 +1,8 @@
 """
-agent.py — High-Performance Agent Logic.
-Optimierungen:
-  - Kein lokales VAD (Silero entfernt).
-  - Keine blockierenden Calls.
+agent.py — Agent Logic.
+SilenceHandler entfernt — Stille-Erkennung laeuft nativ ueber
+Gemini turn_detection (server_vad). Das LLM handelt Schweigen
+selbst gemaess System-Prompt.
 """
 import asyncio
 import logging
@@ -16,119 +16,96 @@ from tools import AppointmentTools
 
 logger = logging.getLogger("intraunit.agent")
 
+
+# ── Agent ─────────────────────────────────────────────────────────────────────
 class SalesAssistant(Agent, AppointmentTools):
     def __init__(self) -> None:
         Agent.__init__(self, instructions=CONFIG.agent.system_prompt)
         logger.debug("SalesAssistant initialisiert")
 
-# ── Silence-Handler ───────────────────────────────────────────────────────────
-class SilenceHandler:
-    def __init__(self, session: AgentSession) -> None:
-        self._session = session
-        self._cfg = CONFIG.silence
-        self._last_agent_text: str = ""
-        self._repeat_count: int = 0
-        self._timer_task: asyncio.Task | None = None
 
-    def attach(self) -> None:
-        @self._session.on("conversation_item_added")
-        def _on_item(event) -> None:
-            item = getattr(event, "item", event)
-            role = getattr(item, "role", None)
-            text = _extract_text(item)
-
-            if role == "assistant" and text:
-                self._last_agent_text = text
-                self._repeat_count = 0
-                self._restart_timer()
-            elif role == "user" and text:
-                self._cancel_timer()
-
-    def _restart_timer(self) -> None:
-        self._cancel_timer()
-        self._timer_task = asyncio.ensure_future(self._silence_timer())
-
-    def _cancel_timer(self) -> None:
-        if self._timer_task and not self._timer_task.done():
-            self._timer_task.cancel()
-            self._timer_task = None
-
-    async def _silence_timer(self) -> None:
-        try:
-            await asyncio.sleep(self._cfg.timeout_s)
-        except asyncio.CancelledError:
-            return
-
-        if self._repeat_count < self._cfg.max_repeats:
-            await self._repeat_last_question()
-        else:
-            await self._close_session_politely()
-
-    async def _repeat_last_question(self) -> None:
-        self._repeat_count += 1
-        logger.info(f"SilenceHandler: Wiederholung {self._repeat_count}")
-        # Kurze Pause für Natürlichkeit
-        await asyncio.sleep(0.5) 
-        
-        instruction = (
-            f"Der Nutzer hat nicht geantwortet. Frage höflich nach. "
-            f"Wiederhole sinngemäß: '{self._last_agent_text}'"
-        )
-        await self._session.generate_reply(instructions=instruction)
-
-    async def _close_session_politely(self) -> None:
-        logger.info("SilenceHandler: Timeout.")
-        await self._session.generate_reply(
-            instructions="Verabschiede dich kurz wegen Inaktivität."
-        )
-
-# ── Helper ────────────────────────────────────────────────────────────────────
-def _extract_text(item) -> str:
-    text = ""
-    if hasattr(item, "content"):
-        if isinstance(item.content, str):
-            text = item.content
-        elif isinstance(item.content, list):
-            for part in item.content:
-                if hasattr(part, "text"): text += part.text
-                elif isinstance(part, str): text += part
-    return text.strip()
-
-# ── Setup (OHNE VAD) ──────────────────────────────────────────────────────────
+# ── Model & Session Builder ───────────────────────────────────────────────────
 def _build_model() -> google.realtime.RealtimeModel:
     return google.realtime.RealtimeModel(
         model=CONFIG.voice.model,
         api_key=CONFIG.google_api_key,
         voice=CONFIG.voice.voice,
-        # WICHTIG: modalities entfernt, da dies Fehler 1007 verursacht
         temperature=CONFIG.voice.temperature,
+        # Gemini Live API hat VAD-basierte Turn-Detection bereits eingebaut.
+        # Kein extra Parameter noetig — laeuft automatisch.
     )
 
+
 def _build_session() -> AgentSession:
-    """
-    Erstellt Session OHNE VAD.
-    Das Audio wird direkt gestreamt. Maximale Performance.
-    """
+    """Session OHNE lokales VAD — Audio direkt gestreamt, maximale Performance."""
     return AgentSession(
-        llm=_build_model(),      
+        llm=_build_model(),
         tts=None,  # Gemini macht Audio nativ
     )
+
+
+# ── Retry-Wrapper fuer Session-Start ─────────────────────────────────────────
+async def _start_session_with_retry(
+    session: AgentSession,
+    assistant: SalesAssistant,
+    room,
+) -> None:
+    """Exponential backoff beim Session-Start — verhindert Crash bei kurzer Nichterreichbarkeit."""
+    cfg = CONFIG.retry
+    last_error: Exception | None = None
+
+    for attempt in range(cfg.max_attempts):
+        try:
+            await session.start(assistant, room=room)
+            logger.info(f"Session gestartet (Versuch {attempt + 1})")
+            return
+        except Exception as e:
+            last_error = e
+            wait = cfg.backoff_base_s ** attempt
+            logger.warning(
+                f"Session-Start Versuch {attempt + 1}/{cfg.max_attempts} "
+                f"fehlgeschlagen ({e}), retry in {wait:.1f}s..."
+            )
+            if attempt < cfg.max_attempts - 1:
+                await asyncio.sleep(wait)
+
+    raise RuntimeError(
+        f"Session konnte nach {cfg.max_attempts} Versuchen nicht gestartet werden: {last_error}"
+    )
+
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext) -> None:
     logger.info(f"Session Start: {ctx.room.name}")
-    
-    # Audio Only abonnieren spart Bandbreite
+
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     assistant = SalesAssistant()
     session = _build_session()
 
-    # Silence Handler als Hintergrund-Logik
-    silence_handler = SilenceHandler(session)
-    silence_handler.attach()
+    try:
+        await _start_session_with_retry(session, assistant, ctx.room)
+    except RuntimeError as e:
+        logger.critical(str(e))
+        return
 
-    await session.start(assistant, room=ctx.room)
-    
-    # Initialer Ping an Gemini für die Begrüßung
-    await session.generate_reply(instructions=CONFIG.agent.greeting)
+    # Disconnect-Event VOR dem Greeting registrieren —
+    # verhindert Race-Condition wenn User sofort auflegt
+    disconnect_event = asyncio.Event()
+
+    @ctx.room.on("disconnected")
+    def _on_disconnect(*_):
+        disconnect_event.set()
+
+    # Greeting nur senden wenn Session noch laeuft
+    await asyncio.sleep(CONFIG.agent.greeting_delay_s)
+    if not disconnect_event.is_set():
+        try:
+            await session.generate_reply(instructions=CONFIG.agent.greeting)
+        except RuntimeError as e:
+            logger.warning(f"Greeting nicht gesendet (Session bereits beendet): {e}")
+
+    try:
+        await disconnect_event.wait()
+    finally:
+        logger.info(f"Session beendet: {ctx.room.name}")
