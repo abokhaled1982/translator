@@ -229,9 +229,19 @@ async def entrypoint(ctx: JobContext) -> None:
     end_event = asyncio.Event()
     
     # ── end_call Callback ─────────────────────────────────────────────────────
+    # In agent.py suchen wir die Funktion entrypoint und ändern den _handle_end_call
+
+    # ── end_call Callback ─────────────────────────────────────────────────────
     async def _handle_end_call() -> None:
         """Wird vom end_call Tool ausgelöst — beendet Session sauber."""
-        logger.info(f"📞 Call beendet durch Agent: {room_name}")
+        logger.info(f"📞 Agent möchte auflegen. Warte auf Audio-Output...")
+        
+        # WICHTIG: Wir warten 4 Sekunden bei offener Leitung.
+        # Das garantiert, dass die Verabschiedung ("Tschüss!") beim User ankommt,
+        # bevor wir den WebSocket killen.
+        await asyncio.sleep(4.0)
+        
+        logger.info(f"📞 Call jetzt wirklich beendet: {room_name}")
         health.mark_not_ready()
         end_event.set()
     
