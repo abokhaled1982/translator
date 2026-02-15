@@ -1,0 +1,74 @@
+{
+  "company": {
+    "name": "IntraUnit",
+    "founder": "Waled Al-Ghobari",
+    "founder_role": "AI Consultant & Architect",
+    "location": "Sindelfingen, Deutschland",
+    "contact": {
+      "email": "info@intraunit.com",
+      "personal_email": "waled@intraunit.com"
+    },
+    "mission": "Wir verbinden solide Software-Architektur mit moderner KI. Keine Buzzwords, sondern funktionierende Systeme.",
+    "meeting_options": [
+      "Persönliches Treffen auf einen Kaffee in Sindelfingen",
+      "Virtuelles Meeting per Video-Call"
+    ]
+  },
+  "services": [
+    {
+      "name": "AI Strategy & Consulting",
+      "description": "Wir analysieren deine bestehende Infrastruktur und identifizieren konkrete KI-Potenziale für dein Unternehmen."
+    },
+    {
+      "name": "Process Automation",
+      "description": "Intelligente Agenten die repetitive Workflows übernehmen und deinen Teams Zeit freimachen."
+    },
+    {
+      "name": "Predictive Analytics",
+      "description": "ML-Modelle die Markttrends und Entwicklungen vorhersagen bevor sie eintreten."
+    },
+    {
+      "name": "NLP Solutions",
+      "description": "Sentiment-Analyse, automatische Dokumentenzusammenfassung und intelligente Suche."
+    },
+    {
+      "name": "MLOps",
+      "description": "Wir bauen, deployen und überwachen skalierbare Modell-Infrastruktur — damit KI nicht nur im Labor funktioniert."
+    },
+    {
+      "name": "AI Security & Ethics",
+      "description": "DSGVO-konforme, robuste und unvoreingenommene KI-Systeme die auch unter Prüfung standhalten."
+    }
+  ],
+  "process": [
+    {
+      "step": 1,
+      "name": "AI-Powered Discovery",
+      "description": "Automatisierte Anforderungsanalyse — wir verstehen dein Problem bevor wir eine Lösung vorschlagen."
+    },
+    {
+      "step": 2,
+      "name": "Blueprint & Transparent Pricing",
+      "description": "Du bekommst einen klaren technischen Fahrplan und eine modulare Preiskalkulation ohne versteckte Kosten."
+    },
+    {
+      "step": 3,
+      "name": "Agile Development",
+      "description": "Entwicklung in 2-Wochen-Sprints mit Staging-Umgebung — du siehst Fortschritt, keine Powerpoints."
+    },
+    {
+      "step": 4,
+      "name": "Deployment & Scaling",
+      "description": "Rollout auf Cloud-Infrastruktur mit aktivem Monitoring. Wir bleiben dabei."
+    }
+  ],
+  "agent": {
+    "name": "Sarah",
+    "role": "IntraUnit AI Lead",
+    "language": "Deutsch (primär), Englisch falls Kunde Englisch spricht"
+  },
+  "booking": {
+    "confirmation_email_required": true,
+    "info_to_collect": ["Vorname", "Nachname", "E-Mail-Adresse", "Wunschtermin (Datum + Uhrzeit)", "Anliegen / Thema des Meetings"]
+  }
+}

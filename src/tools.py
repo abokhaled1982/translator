@@ -1,33 +1,29 @@
 """
 tools.py — Alle Function-Tools des Intraunit-Agenten.
 
-Verbesserungen vs. Original:
-  - asyncio.timeout() fuer alle API-Calls (verhindert Agent-Freeze)
-  - HTTP Connection-Pool als Singleton (kein neues Client-Objekt pro Call)
-  - date.fromisoformat() statt strptime (schneller, threadsafe)
-  - Sauberes Teardown via close_http_client()
-  - Datum-Aufloesung liegt beim LLM (System-Prompt) - kein Python-Code noetig
+Verbesserungen:
+  - context: RunContext entfernt (nie benutzt, konnte 1008 ausloesen)
+  - end_call Tool — beendet Session sauber nach Aufgaben-Abschluss
+  - reserve_appointment: email-Feld hinzugefuegt fuer Buchungsbestaetigung
+  - HTTP Connection-Pool als Singleton
 """
 import asyncio
 import logging
 from datetime import date, timedelta
-from typing import Annotated
+from typing import Annotated, Callable, Optional
 
-from livekit.agents import llm, RunContext
+from livekit.agents import llm
 
 from config import CONFIG
 
 logger = logging.getLogger("intraunit.tools")
 
 
-# ── HTTP Connection-Pool Singleton ────────────────────────────────────────────
-# Lazy-Init beim ersten Tool-Call.
-# Ein persistenter Client ist ~10x schneller als ein neuer Client pro Call.
+# ── HTTP Connection-Pool ──────────────────────────────────────────────────────
 _http_client = None
 
 
 def _get_http_client():
-    """Gibt den globalen HTTP-Client zurueck (lazy, thread-safe fuer async)."""
     global _http_client
     if _http_client is None:
         try:
@@ -39,201 +35,149 @@ def _get_http_client():
                     max_connections=cfg.http_max_connections,
                     max_keepalive_connections=cfg.http_max_keepalive,
                 ),
-                headers={"User-Agent": "Intraunit-Agent/1.0"},
+                headers={"User-Agent": "IntraUnit-Agent/1.0"},
             )
-            logger.debug("HTTP Connection-Pool initialisiert")
         except ImportError:
-            logger.warning("httpx nicht installiert — HTTP-Client nicht verfuegbar")
+            logger.warning("httpx nicht installiert")
     return _http_client
 
 
 async def close_http_client() -> None:
-    """Schliesst den HTTP-Client sauber. Im App-Shutdown aufrufen."""
     global _http_client
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
-        logger.debug("HTTP Connection-Pool geschlossen")
 
 
 # ── Tool-Klasse ───────────────────────────────────────────────────────────────
 class AppointmentTools:
-    """
-    Gebuendelte Tool-Klasse fuer den SalesAssistant.
-    Alle Methoden sind @llm.function_tool-dekoriert und werden
-    automatisch vom LLM aufgerufen.
 
-    Hinweis: Das LLM (Gemini) rechnet Datumsangaben wie 'morgen' oder
-    'naechsten Montag' selbst in ISO-Format um (via System-Prompt).
-    Hier wird nur noch ISO YYYY-MM-DD erwartet.
-    """
+    def __init__(self) -> None:
+        self._end_call_callback: Optional[Callable] = None
 
+    def set_end_call_callback(self, callback: Callable) -> None:
+        self._end_call_callback = callback
+
+    # ── end_call ──────────────────────────────────────────────────────────────
+    @llm.function_tool
+    async def end_call(self) -> str:
+        """
+        Beendet das Gespraech sauber.
+        Aufrufen nachdem die Verabschiedung gesagt wurde.
+        """
+        logger.info("end_call ausgeloest")
+        if self._end_call_callback:
+            asyncio.get_event_loop().call_later(
+                CONFIG.agent.goodbye_delay_s,
+                lambda: asyncio.ensure_future(self._end_call_callback())
+            )
+        return "call_ended"
+
+    # ── check_availability ────────────────────────────────────────────────────
     @llm.function_tool
     async def check_availability(
         self,
-        context: RunContext,
         requested_date: Annotated[str, "Angefragtes Datum im ISO-Format YYYY-MM-DD"],
     ) -> str:
-        """
-        Prueft ob ein Datum verfuegbar ist.
-        Erkennt Wochenenden und schlaegt automatisch den naechsten Werktag vor.
-        """
+        """Prueft ob ein Datum verfuegbar ist. Wochenenden werden automatisch erkannt."""
         logger.info(f"check_availability → {requested_date!r}")
-
         try:
             parsed = date.fromisoformat(requested_date)
 
             if parsed < date.today():
-                return (
-                    "Dieses Datum liegt in der Vergangenheit. "
-                    "Welches zukuenftige Datum passt Ihnen?"
-                )
+                return "Das Datum liegt in der Vergangenheit. Welches Datum hast du dir vorgestellt?"
 
-            # Wochenende → naechsten Montag vorschlagen
-            if parsed.weekday() == 5:  # Samstag
+            if parsed.weekday() == 5:
                 next_monday = parsed + timedelta(days=2)
                 return (
                     f"Samstags sind wir nicht erreichbar. "
-                    f"Ich haette noch freie Slots am Montag, dem "
-                    f"{next_monday.strftime('%d.%m.%Y')} — passt das?"
-                )
-            if parsed.weekday() == 6:  # Sonntag
-                next_monday = parsed + timedelta(days=1)
-                return (
-                    f"Sonntags haben wir Ruhetag. "
                     f"Wie waere Montag, der {next_monday.strftime('%d.%m.%Y')}?"
                 )
+            if parsed.weekday() == 6:
+                next_monday = parsed + timedelta(days=1)
+                return (
+                    f"Sonntags haben wir frei. "
+                    f"Montag, der {next_monday.strftime('%d.%m.%Y')} waere moeglich — passt das?"
+                )
 
-            # TODO: Echte Kalender-API einbinden (dann asyncio.timeout einbauen):
-            # async with asyncio.timeout(CONFIG.tools.api_timeout_s):
-            #     client = _get_http_client()
-            #     resp = await client.get(f"/calendar/slots?date={requested_date}")
-            #     slots = resp.json()
-            #     if not slots:
-            #         return f"Am {parsed.strftime('%d.%m.%Y')} bin ich leider ausgebucht."
-
+            # TODO: Echte Kalender-API einbinden
             return (
                 f"Am {parsed.strftime('%d.%m.%Y')} habe ich noch freie Slots. "
                 "Lieber Vormittags oder Nachmittags?"
             )
 
-        except asyncio.TimeoutError:
-            logger.error("check_availability: Kalender-API Timeout")
-            return (
-                "Mein Kalender reagiert gerade etwas langsam. "
-                "Nennen Sie mir Ihren Wunschtermin — wir finden eine Loesung."
-            )
         except ValueError:
             logger.warning(f"Ungueltiges Datumsformat: {requested_date!r}")
-            return (
-                "Das Datum konnte ich nicht lesen. "
-                "Bitte nennen Sie mir Tag, Monat und Jahr."
-            )
+            return "Das Datum habe ich leider nicht verstanden. Kannst du Tag, Monat und Jahr nochmal nennen?"
         except Exception:
             logger.exception("Fehler in check_availability")
-            return (
-                "Ich kann den Kalender gerade nicht einsehen. "
-                "Nennen Sie mir Ihren Wunschtermin — wir finden eine Loesung."
-            )
+            return "Ich kann den Kalender gerade nicht pruefen. Nenn mir deinen Wunschtermin — wir finden eine Loesung."
 
+    # ── reserve_appointment ───────────────────────────────────────────────────
     @llm.function_tool
     async def reserve_appointment(
         self,
-        context: RunContext,
         name: Annotated[str, "Vollstaendiger Name des Kunden"],
+        email: Annotated[str, "E-Mail-Adresse fuer die Buchungsbestaetigung"],
         appointment_date: Annotated[str, "Datum des Termins (YYYY-MM-DD)"],
         appointment_time: Annotated[str, "Uhrzeit des Termins (HH:MM, 24h-Format)"],
+        topic: Annotated[str, "Kurzes Anliegen oder Thema des Meetings"],
     ) -> str:
         """
         Bucht einen Termin verbindlich.
-        Wird erst aufgerufen, nachdem der Kunde ausdruecklich zugestimmt hat.
+        Nur aufrufen nachdem der Kunde ausdruecklich bestaetigt hat.
         """
-        logger.info(f"reserve_appointment → {name} | {appointment_date} {appointment_time}")
-
+        logger.info(f"reserve_appointment → {name} | {email} | {appointment_date} {appointment_time} | {topic}")
         try:
             parsed_date = date.fromisoformat(appointment_date)
 
             if parsed_date < date.today():
-                return (
-                    "Dieses Datum liegt in der Vergangenheit. "
-                    "Bitte nennen Sie mir ein zukuenftiges Datum."
-                )
+                return "Dieses Datum liegt in der Vergangenheit. Bitte nenn mir ein zukuenftiges Datum."
 
-            # Uhrzeit validieren
             try:
                 h, m = appointment_time.split(":")
                 hour, minute = int(h), int(m)
                 if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                    raise ValueError("Ungueltiger Zeitwert")
+                    raise ValueError
             except (ValueError, AttributeError):
-                return (
-                    "Die Uhrzeit konnte ich nicht lesen. "
-                    "Bitte nennen Sie mir die Uhrzeit im Format Stunden:Minuten."
-                )
+                return "Die Uhrzeit habe ich nicht verstanden. Bitte nochmal im Format Stunden:Minuten."
 
             readable_date = parsed_date.strftime("%d.%m.%Y")
             readable_time = f"{hour:02d}:{minute:02d}"
 
-            # TODO: Echten API-Call einbauen (dann asyncio.timeout einbauen):
+            # TODO: Echte Kalender-API / CRM einbinden:
             # async with asyncio.timeout(CONFIG.tools.api_timeout_s):
             #     client = _get_http_client()
             #     resp = await client.post("/appointments", json={
             #         "name": name,
+            #         "email": email,
             #         "date": appointment_date,
             #         "time": appointment_time,
+            #         "topic": topic,
             #     })
-            #     if not resp.is_success:
-            #         raise ConnectionError(f"API Error: {resp.status_code}")
 
-            logger.info(f"Termin gebucht: {name} am {readable_date} um {readable_time}")
+            logger.info(f"Termin gebucht: {name} <{email}> am {readable_date} um {readable_time} — {topic}")
             return (
-                f"Perfekt, {name} — Ihr Termin am {readable_date} um {readable_time} Uhr "
-                "ist jetzt fest eingetragen. Sie erhalten gleich eine Bestaetigung per E-Mail."
+                f"Alles klar, {name.split()[0]} — dein Termin am {readable_date} um {readable_time} Uhr ist eingetragen. "
+                f"Die Bestaetigung geht an {email}."
             )
 
         except asyncio.TimeoutError:
-            logger.error("reserve_appointment: Kalender-API Timeout")
-            return (
-                "Mein Kalender ist gerade kurz nicht erreichbar. "
-                "Ich notiere Ihre Daten und ein Kollege bestaetigt den Termin per Rueckruf."
-            )
-        except ValueError as e:
-            logger.warning(f"Format-Fehler bei Buchung: {e}")
-            return (
-                "Datum oder Uhrzeit konnte ich nicht lesen. "
-                "Bitte nennen Sie mir Tag, Monat, Jahr und Uhrzeit noch einmal."
-            )
-        except ConnectionError as e:
-            logger.error(f"Kalender nicht erreichbar: {e}")
-            return (
-                "Mein Kalender ist gerade kurz nicht erreichbar. "
-                "Ich notiere Ihre Daten und ein Kollege bestaetigt den Termin per Rueckruf."
-            )
+            logger.error("reserve_appointment: API Timeout")
+            return "Mein Kalender ist gerade kurz nicht erreichbar. Ich notiere deine Daten und Waled meldet sich per Mail."
         except Exception:
-            logger.exception("Unerwarteter Fehler in reserve_appointment")
-            return (
-                "Es gab einen technischen Fehler. "
-                "Ein Mitarbeiter ruft Sie zur Bestaetigung zurueck."
-            )
+            logger.exception("Fehler in reserve_appointment")
+            return "Es gab einen technischen Fehler. Ein Kollege wird sich bei dir melden."
 
+    # ── transfer_to_specialist ────────────────────────────────────────────────
     @llm.function_tool
     async def transfer_to_specialist(
         self,
-        context: RunContext,
-        topic: Annotated[str, "Das technische Thema, das der Kunde besprechen moechte"],
+        topic: Annotated[str, "Das Thema das der Kunde besprechen moechte"],
     ) -> str:
-        """
-        Signalisiert dem Kunden, dass ein Spezialist uebernimmt.
-        Wird bei komplexen technischen Fragen eingesetzt.
-        """
-        logger.info(f"transfer_to_specialist → Thema: {topic}")
-
-        # TODO: Echten Transfer-Mechanismus einbauen (z.B. LiveKit SIP Transfer):
-        # client = _get_http_client()
-        # await client.post("/transfer", json={"topic": topic})
-
+        """Signalisiert dass Waled persoenlich uebernimmt. Bei komplexen technischen Fragen."""
+        logger.info(f"transfer_to_specialist → {topic}")
         return (
-            f"Das Thema '{topic}' klaert unser Spezialist direkt mit Ihnen — "
-            "das ist genau der richtige Ansprechpartner dafuer. "
-            "Soll ich gleich einen Termin mit ihm fuer Sie reservieren?"
+            f"Das Thema '{topic}' beantwortet dir Waled am besten direkt. "
+            "Soll ich gleich einen Termin fuer euch eintragen?"
         )
