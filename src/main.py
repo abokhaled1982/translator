@@ -20,7 +20,6 @@ import sys
 import os
 import signal
 import asyncio
-import atexit
 
 # ── Pfad-Fix ──────────────────────────────────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -48,14 +47,11 @@ else:
     sys.exit(1)
 
 # ── 2. Imports ────────────────────────────────────────────────────────────────
-# WICHTIG: plugin_patch MUSS VOR allen livekit-Imports stehen
-import plugin_patch  # Behebt 1008-Bug bei Gemini Function Calling
 
 from logging_setup import setup_logging, teardown as logging_teardown
 from config import CONFIG
 import health
 from agent import entrypoint
-from tools import close_http_client
 from livekit.agents import cli, WorkerOptions
 
 CONFIG.mode = _MODE
@@ -83,9 +79,9 @@ except EnvironmentError as e:
 # ── 4. Health-Check Server starten ────────────────────────────────────────────
 health.start(host=CONFIG.server.health_host, port=CONFIG.server.health_port)
 
-# Initial State: Prozess läuft (liveness=true), aber noch nicht ready
-# health.mark_ready() wird in agent.py nach erfolgreichem Session-Start aufgerufen
+# Initial State: Prozess läuft, startup fertig, ready für neue Sessions
 health.mark_startup_complete()
+health.mark_ready()
 
 # ── 5. Graceful Shutdown Handler ──────────────────────────────────────────────
 _shutdown_initiated = False
@@ -97,57 +93,51 @@ def _graceful_shutdown(sig, frame) -> None:
     
     Flow:
       1. Mark as not ready → K8s stoppt Traffic
-      2. Wait for active sessions (bis timeout)
-      3. Cleanup resources
-      4. Exit
+      2. Close HTTP resources (sync)
+      3. Stop health server
+      4. Teardown logging
     """
     global _shutdown_initiated
     
     if _shutdown_initiated:
-        logger.warning("⚠️  Shutdown bereits eingeleitet...")
         return
     
     _shutdown_initiated = True
     
-    signal_name = "SIGTERM" if sig == signal.SIGTERM else "SIGINT"
+    signal_name = (
+        "SIGTERM" if sig == signal.SIGTERM
+        else "SIGINT" if sig == signal.SIGINT
+        else "atexit"
+    )
     logger.info(f"🛑 {signal_name} empfangen — Graceful Shutdown eingeleitet")
     
     # 1. Als not-ready markieren → kein neuer Traffic
     health.mark_not_ready()
     
-    # 2. Kurz warten damit aktive Sessions enden können
-    logger.info(f"⏳ Warte {CONFIG.server.shutdown_timeout_s}s auf aktive Sessions...")
-    
+    # 2. HTTP Client synchron schließen (Event loop ist ggf. schon zu)
     try:
-        loop = asyncio.get_event_loop()
-        
-        # HTTP Client schließen
-        if loop.is_running():
-            loop.create_task(close_http_client())
-        else:
-            loop.run_until_complete(close_http_client())
-        
-        logger.info("✓ HTTP Client geschlossen")
-    
+        from tools import _http_client
+        if _http_client is not None:
+            # httpx.AsyncClient kann NICHT sicher sync geschlossen werden
+            # wenn der Loop weg ist — einfach auf None setzen, GC räumt auf.
+            import tools
+            tools._http_client = None
+            logger.info("✓ HTTP Client freigegeben")
     except Exception as e:
         logger.warning(f"⚠️  HTTP-Client Teardown Fehler: {e}")
     
-    # 3. Logging sauber beenden
-    logging_teardown()
-    
-    # 4. Health Server stoppen
+    # 3. Health Server stoppen (idempotent)
     health.stop()
     
+    # 4. Logging sauber beenden
+    logging_teardown()
+    
     logger.info("👋 Shutdown abgeschlossen")
-    sys.exit(0)
 
 
 # Signal Handler registrieren
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 signal.signal(signal.SIGINT, _graceful_shutdown)
-
-# Auch atexit als Fallback
-atexit.register(lambda: _graceful_shutdown(None, None) if not _shutdown_initiated else None)
 
 # ── 6. LiveKit Worker starten ─────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -167,8 +157,7 @@ if __name__ == "__main__":
         cli.run_app(worker_options)
     
     except KeyboardInterrupt:
-        logger.info("⌨️  Agent beendet (Strg+C)")
-        _graceful_shutdown(signal.SIGINT, None)
+        pass  # Signal handler already ran
     
     except Exception as e:
         health.mark_unhealthy()
@@ -180,15 +169,4 @@ if __name__ == "__main__":
         sys.exit(1)
     
     finally:
-        # Final Cleanup
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(close_http_client())
-            else:
-                loop.run_until_complete(close_http_client())
-        except Exception:
-            pass
-        
-        logging_teardown()
-        health.stop()
+        _graceful_shutdown(None, None)  # idempotent, no-op if already ran

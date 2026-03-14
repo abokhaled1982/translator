@@ -241,12 +241,17 @@ def start(host: str = "0.0.0.0", port: int = 8080) -> None:
 
 
 def stop() -> None:
-    """Stoppt den Health-Check-Server gracefully."""
+    """Stoppt den Health-Check-Server gracefully (idempotent)."""
     global _server
-    if _server:
-        logger.info("Stopping health check server...")
-        _server.shutdown()
-        _server = None
+    srv = _server
+    if srv is None:
+        return
+    _server = None  # Prevent double-stop
+    logger.info("Stopping health check server...")
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

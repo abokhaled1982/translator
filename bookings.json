@@ -1,0 +1,38 @@
+[
+  {
+    "created_at": "2026-03-11T14:14:00.306454",
+    "name": "Sirag Maraka",
+    "email": "ramadan.desmih",
+    "date": "2026-03-12",
+    "time": "15:30",
+    "topic": "IntraUnit kennenlernen",
+    "status": "confirmed_mock"
+  },
+  {
+    "created_at": "2026-03-11T14:47:57.294006",
+    "name": "Markus Nordenstein",
+    "email": "markus.nordenstein@tek.de",
+    "date": "2026-03-12",
+    "time": "15:30",
+    "topic": "kennenlernen",
+    "status": "confirmed_mock"
+  },
+  {
+    "created_at": "2026-03-12T23:42:04.125229",
+    "name": "Ahmad Ali",
+    "email": "info@intraunit.de",
+    "date": "2027-07-05",
+    "time": "8:30",
+    "topic": "KI im Unternehmen",
+    "status": "calcom_failed_local_saved"
+  },
+  {
+    "created_at": "2026-03-12T23:58:17.701288",
+    "name": "Waled Al-Ghobari",
+    "email": "info@intraunit.de",
+    "date": "2026-03-17",
+    "time": "11:00",
+    "topic": "allgemeine KI-Beratung",
+    "status": "calcom_failed_local_saved"
+  }
+]

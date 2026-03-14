@@ -1,16 +1,12 @@
 """
-agent.py — Professional Agent Logic mit Production Features.
+agent.py — Voice Agent mit Shadow Tool Executor.
 
-Verbesserungen:
-  - Natürlicher Gesprächsfluss mit realistischen Pausen
-  - Robustes Session-Management mit Reconnect-Logik
-  - Graceful Degradation bei Fehlern
-  - Strukturiertes Error Handling
-  - Health Check Integration
-  - Metrics & Monitoring Ready
+Kein Gemini Function Calling — eliminiert 1008 WebSocket-Fehler komplett.
+Tools werden vom IntentHandler im Hintergrund ausgeführt.
 """
 import asyncio
 import logging
+import threading
 from typing import Optional
 
 from livekit.agents import JobContext, AutoSubscribe
@@ -19,18 +15,17 @@ from livekit.plugins import google
 
 import health
 from config import CONFIG
-from tools import AppointmentTools
+from intent_handler import IntentHandler
 
 logger = logging.getLogger("intraunit.agent")
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
-class SalesAssistant(Agent, AppointmentTools):
-    """Professioneller Voice Sales Agent mit natürlichem Gesprächsverhalten."""
+class SalesAssistant(Agent):
+    """Voice Sales Agent — reiner Audio-Modus ohne Function Calling."""
     
     def __init__(self) -> None:
-        Agent.__init__(self, instructions=CONFIG.agent.system_prompt)
-        AppointmentTools.__init__(self)
+        super().__init__(instructions=CONFIG.agent.system_prompt)
         logger.debug(f"✨ {CONFIG.agent.agent_name} initialisiert")
 
 
@@ -136,8 +131,8 @@ async def _handle_reconnect(
             # Kurze Info an User
             await session.generate_reply(
                 instructions=(
-                    "Die Verbindung war kurz unterbrochen, aber jetzt läuft alles wieder. "
-                    "Wo waren wir stehen geblieben?"
+                    "Die Verbindung war kurz unterbrochen, aber jetzt ist alles wieder in Ordnung. "
+                    "Entschuldigen Sie die Störung — wo waren wir stehen geblieben?"
                 )
             )
             
@@ -184,15 +179,15 @@ async def _send_goodbye(
         if reason == "timeout":
             message = (
                 "Die maximale Gesprächsdauer ist leider erreicht. "
-                "Lass uns gerne beim nächsten Mal weitermachen. Ciao!"
+                "Vielen Dank für Ihren Anruf — melden Sie sich gerne jederzeit wieder. Auf Wiedersehen!"
             )
         elif reason == "error":
             message = (
-                "Entschuldige, da gibt's gerade ein technisches Problem. "
-                "Wir melden uns bei dir. Bis dann!"
+                "Entschuldigen Sie, es gibt gerade ein technisches Problem. "
+                "Herr Al-Ghobari meldet sich persönlich bei Ihnen. Auf Wiedersehen!"
             )
         else:
-            message = "Alles klar, mach's gut!"
+            message = "Vielen Dank für Ihren Anruf. Auf Wiedersehen!"
         
         await session.generate_reply(instructions=message)
         logger.debug(f"👋 Goodbye gesendet (Grund: {reason})")
@@ -220,32 +215,68 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error(f"❌ Room-Connect fehlgeschlagen: {e}", exc_info=True)
         health.mark_unhealthy()
         return
+
+    # Suppress "ignoring text stream" warnings — drain in a separate thread
+    # so the main asyncio loop (LLM) is never blocked or slowed down.
+    _stream_drain_loop = asyncio.new_event_loop()
+
+    def _drain_thread():
+        asyncio.set_event_loop(_stream_drain_loop)
+        _stream_drain_loop.run_forever()
+
+    _drain_t = threading.Thread(target=_drain_thread, daemon=True, name="stream-drain")
+    _drain_t.start()
+
+    async def _drain_reader(reader):
+        try:
+            async for _ in reader:
+                pass
+        except Exception:
+            pass
+
+    def _offload_stream(reader, _participant_identity):
+        asyncio.run_coroutine_threadsafe(_drain_reader(reader), _stream_drain_loop)
+
+    ctx.room.register_text_stream_handler("lk.agent.request", _offload_stream)
+    
+    # ── SIP-Anrufer erkennen ──────────────────────────────────────────────────
+    caller_number = None
+    is_sip_call = False
+    for p in ctx.room.remote_participants.values():
+        if p.kind == "SIP" or (p.attributes and p.attributes.get("sip.callID")):
+            is_sip_call = True
+            caller_number = (p.attributes or {}).get("sip.phoneNumber", "unbekannt")
+            logger.info(f"📞 SIP-Anruf von: {caller_number}")
+            break
+    
+    if not is_sip_call and room_name.startswith("call-"):
+        is_sip_call = True
+        logger.info("📞 SIP-Anruf erkannt (Room-Prefix)")
+    
+    if is_sip_call:
+        logger.info(f"☎️  Telefonanruf aktiv — Raum: {room_name}")
     
     # Agent & Session initialisieren
     assistant = SalesAssistant()
     session = _build_session()
     
-    # Event für Gesprächsende (end_call Tool, User-Disconnect, Timeout)
+    # Event für Gesprächsende (IntentHandler end_call, User-Disconnect, Timeout)
     end_event = asyncio.Event()
     
     # ── end_call Callback ─────────────────────────────────────────────────────
-    # In agent.py suchen wir die Funktion entrypoint und ändern den _handle_end_call
 
     # ── end_call Callback ─────────────────────────────────────────────────────
     async def _handle_end_call() -> None:
-        """Wird vom end_call Tool ausgelöst — beendet Session sauber."""
-        logger.info(f"📞 Agent möchte auflegen. Warte auf Audio-Output...")
-        
-        # WICHTIG: Wir warten 4 Sekunden bei offener Leitung.
-        # Das garantiert, dass die Verabschiedung ("Tschüss!") beim User ankommt,
-        # bevor wir den WebSocket killen.
-        await asyncio.sleep(4.0)
-        
-        logger.info(f"📞 Call jetzt wirklich beendet: {room_name}")
+        """Wird vom IntentHandler bei Verabschiedung ausgelöst."""
+        logger.info(f"📞 Verabschiedung erkannt. Beende Call: {room_name}")
         health.mark_not_ready()
         end_event.set()
     
-    assistant.set_end_call_callback(_handle_end_call)
+    # ── IntentHandler (Shadow Tool Executor) ──────────────────────────────────
+    intent_handler = IntentHandler(
+        session=session,
+        end_callback=_handle_end_call,
+    )
     
     # ── Session starten mit Retry ─────────────────────────────────────────────
     try:
@@ -258,6 +289,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # Session läuft — als ready markieren (Kubernetes Readiness Probe)
     health.mark_ready()
     logger.info(f"✓ Agent ready: {room_name}")
+    
+    # IntentHandler an laufende Session anhängen
+    intent_handler.attach()
     
     # ── Disconnect-Event Handler ──────────────────────────────────────────────
     @ctx.room.on("disconnected")
@@ -295,6 +329,8 @@ async def entrypoint(ctx: JobContext) -> None:
     finally:
         # ── Cleanup ───────────────────────────────────────────────────────────
         health.mark_not_ready()
+        intent_handler.close()  # Stop injecting into closed session
+        _stream_drain_loop.call_soon_threadsafe(_stream_drain_loop.stop)
         logger.info(f"🛑 Session beendet: {room_name}")
         
         try:
